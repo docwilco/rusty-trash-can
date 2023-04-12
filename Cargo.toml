@@ -1,0 +1,12 @@
+[package]
+name = "rusty-trash-can"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dotenv = "0.15.0"
+serenity = { version = "0", default-features = false, features = ["cache", "client", "gateway", "http", "rustls_backend", "model", "time"] }
+time = "0.3.20"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
