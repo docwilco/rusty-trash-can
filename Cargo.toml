@@ -1,12 +1,18 @@
 [package]
 name = "rusty-trash-can"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-dotenv = "0.15.0"
+ctrlc = { version = "3.2.5", features = ["termination"] }
+# For now, we're using major semvers only, as everything is still quite in flux.
+dotenv = "0"
+duration-str = { version = "0", default-features = false, features = ["serde", "time"] }
+poise = { version = "0", features = ["time", "cache"], default-features = false }
+rusqlite = { version = "0", features = ["backup", "bundled"] }
 serenity = { version = "0", default-features = false, features = ["cache", "client", "gateway", "http", "rustls_backend", "model", "time"] }
-time = "0.3.20"
+time = "0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-rusqlite = "0.4.0"
