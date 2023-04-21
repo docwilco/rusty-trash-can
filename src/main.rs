@@ -10,8 +10,8 @@ use tokio_rusqlite::Connection;
 
 #[derive(Debug, Default)]
 struct Channel {
-    max_messages: Option<u64>,
     max_age: Option<Duration>,
+    max_messages: Option<u64>,
     message_ids: VecDeque<MessageId>,
     delete_queue: Vec<MessageId>,
 }
@@ -25,7 +25,6 @@ impl Channel {
             let mut ids = self.message_ids.iter();
             loop {
                 let id = ids.next();
-                println!("checking message id: {:?}", id);
                 if id.is_none() {
                     break;
                 }
@@ -91,8 +90,8 @@ type Context<'a> = poise::Context<'a, Data, Error>;
 )]
 async fn autodelete(
     ctx: Context<'_>,
-    #[description = "Max number of messages to keep"] max_messages: Option<u64>,
     #[description = "Max age of messages"] max_age: Option<String>,
+    #[description = "Max number of messages to keep"] max_messages: Option<u64>,
 ) -> Result<(), Error> {
     let max_age = max_age
         .map(duration_str::parse_time)
@@ -113,8 +112,9 @@ async fn autodelete(
     }
     let channel = ctx.data().channels.get(ctx.channel_id()).await;
     let mut channel_guard = channel.lock().await;
-    channel_guard.max_messages = max_messages;
+    let was_inactive = channel_guard.max_age.is_none() && channel_guard.max_messages.is_none();
     channel_guard.max_age = max_age;
+    channel_guard.max_messages = max_messages;
     drop(channel_guard);
 
     // Write to database
@@ -125,36 +125,33 @@ async fn autodelete(
         .await
         .call(move |conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO channel_settings (channel_id, max_messages, max_age) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO channel_settings (channel_id, max_age, max_messages) VALUES (?, ?, ?)",
                 params![
                     channel_id.0 as i64,
-                    max_messages.map(|x| x as i64),
                     max_age.map(|x| x.whole_seconds()),
+                    max_messages.map(|x| x as i64),
                 ],
             )?;
             Ok(())
         })
         .await?;
-    let message = match (max_messages, max_age) {
-        (Some(max_messages), Some(max_age)) => {
-            format!("max messages: {}, max age: {}", max_messages, max_age)
+    let message = match (max_age, max_messages) {
+        (Some(max_age), Some(max_messages)) => {
+            format!("max age: {}, max messages: {}", max_age, max_messages)
         }
-        (Some(max_messages), None) => format!("max messages: {}", max_messages),
-        (None, Some(max_age)) => format!("max age: {}", max_age),
+        (None, Some(max_messages)) => format!("max messages: {}", max_messages),
+        (Some(max_age), None) => format!("max age: {}", max_age),
         (None, None) => unreachable!(),
     };
     let message = format!("Autodelete settings updated: {}", message);
     ctx.say(message).await?;
 
-    let channels = ctx.data().channels.to_cloned_vec().await;
-
-    for (channel_id, channel) in channels {
-        let channel = channel.lock().await;
-        println!(
-            "channel<{:?}>: max_age: {:?}, max_messages: {:?}",
-            channel_id, channel.max_age, channel.max_messages
-        );
+    if was_inactive {
+        // fetch all messages before the command
+        let earliest = ctx.created_at();
+        println!("earliest: {:?} now: {:?}", earliest, Timestamp::now());
     }
+
     Ok(())
 }
 
@@ -250,7 +247,9 @@ async fn event_event_handler(
                 }
             }
         }
-        _ => {}
+        _ => {
+            println!("Unhandled event: {:?}", event)
+        }
     }
 
     Ok(())
@@ -267,23 +266,23 @@ async fn main() {
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS channel_settings (
                     channel_id INTEGER PRIMARY KEY,
-                    max_messages INTEGER,
-                    max_age INTEGER
+                    max_age INTEGER,
+                    max_messages INTEGER
                 )",
                 [],
             )?;
             let mut channel_settings =
-                conn.prepare("SELECT channel_id, max_messages, max_age FROM channel_settings")?;
+                conn.prepare("SELECT channel_id, max_age, max_messages FROM channel_settings")?;
             let channel_settings: HashMap<ChannelId, Channel> = channel_settings
                 .query_map([], |row| {
                     let channel_id: i64 = row.get(0)?;
-                    let max_messages: Option<i64> = row.get(1)?;
-                    let max_age: Option<i64> = row.get(2)?;
+                    let max_age: Option<i64> = row.get(1)?;
+                    let max_messages: Option<i64> = row.get(2)?;
                     Ok((
                         ChannelId(channel_id as u64),
                         Channel {
-                            max_messages: max_messages.map(|x| x as u64),
                             max_age: max_age.map(Duration::seconds),
+                            max_messages: max_messages.map(|x| x as u64),
                             ..Default::default()
                         },
                     ))
