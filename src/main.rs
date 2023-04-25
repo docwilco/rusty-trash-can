@@ -14,7 +14,6 @@
 /// * Put delete queues back into message id lists when shutting down
 use itertools::Itertools;
 use poise::say_reply;
-use poise::serenity_prelude::routing::Route;
 use poise::serenity_prelude::{CacheHttp, Http, MessageId, StatusCode, Timestamp};
 use rusqlite::params;
 use serenity::model::prelude::{ChannelId, GatewayIntents};
@@ -160,7 +159,6 @@ async fn fetch_message_history(
         message_id.unwrap_or_default()
     );
     let mut origin = message_id;
-    let mut message_ids: Vec<MessageId> = Vec::new();
     // If there's no message_id, we're fetching the most recent messages
     // so always go backwards in that case.
     let direction = if message_id.is_none() {
@@ -169,16 +167,9 @@ async fn fetch_message_history(
         direction
     };
     loop {
-        println!(
-            "Messages ratelimit: {:?}",
-            http.as_ref()
-                .ratelimiter
-                .routes()
-                .read()
-                .await
-                .get(&Route::ChannelsIdMessages(channel_id.into()))
-                .cloned()
-        );
+        // These requests are automatically rate limited by serenity, so it
+        // can take a while to fetch a lot of messages. Put them in our channel
+        // metadata as we get each chunk.
         let messages = channel_id
             .messages(&http, |b| match (origin, direction) {
                 (Some(origin), Direction::After) => b.after(origin).limit(100),
@@ -186,16 +177,6 @@ async fn fetch_message_history(
                 (None, _) => b.limit(100),
             })
             .await?;
-        println!(
-            "Messages ratelimit: {:?}",
-            http.as_ref()
-                .ratelimiter
-                .routes()
-                .read()
-                .await
-                .get(&Route::ChannelsIdMessages(channel_id.into()))
-                .cloned()
-        );
         if messages.is_empty() {
             break;
         }
@@ -204,44 +185,50 @@ async fn fetch_message_history(
         } else {
             origin = Some(messages.last().unwrap().id);
         }
-        message_ids.extend(messages.into_iter().map(|m| m.id));
-    }
-    println!(
-        "Fetched {} messages for channel {}",
-        message_ids.len(),
-        channel_id
-    );
-    // Let's check some assumptions
-    let mut sorted_ids = message_ids.clone();
-    sorted_ids.sort_unstable_by_key(|w| Reverse(w.0));
-    if sorted_ids != message_ids {
-        println!("Messages (history) were not returned in order");
-    }
-    sorted_ids.dedup();
-    if sorted_ids != message_ids {
-        println!("Messages (history) were not unique");
-    }
-    // Add to the channel's data
-    // The messages are currently going from newest to oldest, but we want
-    // them in the opposite order, because that's how the channel data has
-    // them. Since messages might have arrived while we retrieved history,
-    // those will already be in the channel data (BEFORE). Or we're just
-    // starting up and getting stuff we missed (AFTER).
-    sorted_ids.reverse();
-    let mut ids = VecDeque::from(sorted_ids);
-    let mut channel_guard = channel.lock().await;
-    if direction == Direction::Before {
-        // We're getting history from before what we know, so put
-        // the new messages at the front. Do that by appending what
-        // we might have to the just retrieved messages, and then
-        // putting the whole result back.
+        let message_ids: Vec<MessageId> = messages.into_iter().map(|m| m.id).collect();
+        println!(
+            "Fetched {} messages for channel {}",
+            message_ids.len(),
+            channel_id
+        );
+        // Let's check some assumptions
+        let mut sorted_ids = message_ids.clone();
+        sorted_ids.sort_unstable_by_key(|w| Reverse(w.0));
+        if sorted_ids != message_ids {
+            println!("Messages (history) were not returned in order");
+        }
+        sorted_ids.dedup();
+        if sorted_ids != message_ids {
+            println!("Messages (history) were not unique");
+        }
+        // Add to the channel's data
+        // The messages are currently going from newest to oldest, but we want
+        // them in the opposite order, because that's how the channel data has
+        // them.
+        sorted_ids.reverse();
+        let mut ids = VecDeque::from(sorted_ids);
+        let mut channel_guard = channel.lock().await;
+        if direction == Direction::Before {
+            // We're getting history from before what we know, so put
+            // the new messages at the front. Do that by appending what
+            // we might have to the just retrieved messages, and then
+            // putting the whole result back.
+            // With the extra append, I'm not sure this is actually faster
+            // than just relying on the sort.
+            ids.append(&mut channel_guard.message_ids);
+        }
+        channel_guard.message_ids.append(&mut ids);
+        // Remove duplicates that might have been added by the message
+        // event handler while we were retrieving history. Do the dedup
+        // after the append, because the append might not be going into
+        // an empty list. (In the case of After).
+        // Sort, then copy back into ids, so we can use into_iter().dedup()
+        // back into the channel metadata.
+        channel_guard.message_ids.make_contiguous().sort_unstable();
         ids.append(&mut channel_guard.message_ids);
+        channel_guard.message_ids.extend(ids.into_iter().dedup());
+        channel_guard.check_max_messages();
     }
-    // Remove duplicates that might have been added by the message
-    // event handler while we were retrieving history
-    channel_guard.message_ids.extend(ids.into_iter().dedup());
-    channel_guard.message_ids.make_contiguous().sort_unstable();
-    channel_guard.check_max_messages();
     Ok(())
 }
 
@@ -576,8 +563,12 @@ async fn event_event_handler(
                 let channel_guard = channel.lock().await;
                 let last_seen = channel_guard.last_seen_message;
                 drop(channel_guard);
-                fetch_message_history(ctx.http(), channel_id, channel, Direction::After, last_seen)
-                    .await?;
+                let http = http.clone();
+                tokio::spawn(async move {
+                    fetch_message_history(http, channel_id, channel, Direction::After, last_seen)
+                        .await
+                        .unwrap();
+                });
             }
         }
         poise::Event::Message { new_message } => {
@@ -691,12 +682,12 @@ async fn main() {
         .collect::<HashMap<ChannelId, Arc<Mutex<Channel>>>>();
 
     let channels = Channels(Arc::new(RwLock::new(channels)));
+    // background task for periodic saving
+    save_task(channels.clone());
     let data = Data {
         db_connection: Arc::new(Mutex::new(db_connection)),
         channels,
     };
-
-    save_task(data.channels.clone());
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
