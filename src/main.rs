@@ -1,20 +1,20 @@
 /// A Discord bot that deletes messages after a certain amount of time or when a maximum number of messages is reached.
 ///
-/// This is inspired by https://github.com/riking/AutoDelete 
+/// This is inspired by https://github.com/riking/AutoDelete
 /// Its maintainer is on extended hiatus, so here's a rewrite in Rust.
-/// 
+///
 /// Some improvements over the original:
 /// * Uses slash commands in addition to regular commands
-/// 
+///
 /// TODO:
 /// * Support for rate limiting
 /// * Spruce up the help text
 /// * Maybe an admin HTTP server with some status info
 /// * Catch signals and do a graceful shutdown
 /// * Put delete queues back into message id lists when shutting down
-
 use itertools::Itertools;
 use poise::say_reply;
+use poise::serenity_prelude::routing::Route;
 use poise::serenity_prelude::{CacheHttp, Http, MessageId, StatusCode, Timestamp};
 use rusqlite::params;
 use serenity::model::prelude::{ChannelId, GatewayIntents};
@@ -169,6 +169,16 @@ async fn fetch_message_history(
         direction
     };
     loop {
+        println!(
+            "Messages ratelimit: {:?}",
+            http.as_ref()
+                .ratelimiter
+                .routes()
+                .read()
+                .await
+                .get(&Route::ChannelsIdMessages(channel_id.into()))
+                .cloned()
+        );
         let messages = channel_id
             .messages(&http, |b| match (origin, direction) {
                 (Some(origin), Direction::After) => b.after(origin).limit(100),
@@ -176,6 +186,16 @@ async fn fetch_message_history(
                 (None, _) => b.limit(100),
             })
             .await?;
+        println!(
+            "Messages ratelimit: {:?}",
+            http.as_ref()
+                .ratelimiter
+                .routes()
+                .read()
+                .await
+                .get(&Route::ChannelsIdMessages(channel_id.into()))
+                .cloned()
+        );
         if messages.is_empty() {
             break;
         }
