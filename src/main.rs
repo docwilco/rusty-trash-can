@@ -30,16 +30,6 @@ use tokio_rusqlite::Connection;
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
-#[derive(Debug, Default)]
-struct Channel {
-    max_age: Option<Duration>,
-    max_messages: Option<u64>,
-    message_ids: VecDeque<MessageId>,
-    delete_queue: Vec<MessageId>,
-    last_seen_message: Option<MessageId>,
-    bot_start_message: Option<MessageId>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Direction {
     Before,
@@ -53,6 +43,16 @@ impl Display for Direction {
             Direction::After => write!(f, "after"),
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct Channel {
+    max_age: Option<Duration>,
+    max_messages: Option<u64>,
+    message_ids: VecDeque<MessageId>,
+    delete_queue: Vec<MessageId>,
+    last_seen_message: Option<MessageId>,
+    bot_start_message: Option<MessageId>,
 }
 
 impl Channel {
@@ -513,6 +513,48 @@ fn delete_task(http: Arc<Http>, channels: Channels) {
     });
 }
 
+// Task to save the message IDs periodically
+// Since this doesn't need a Discord context, it can be started from main()
+fn save_task(channels: Channels) {
+    tokio::spawn(async move {
+        // Use a separate connection for the save task
+        let db_connection = Connection::open("autodelete.db").await.unwrap();
+        loop {
+            let channels_local = channels.to_cloned_vec().await;
+            db_connection
+                .call(move |conn| {
+                    let tx = conn.transaction()?;
+                    tx.execute("DELETE FROM message_ids", [])?;
+                    let mut insert_id = tx.prepare(
+                        "INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)",
+                    )?;
+                    let mut update_last_seen = tx.prepare(
+                        "UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?",
+                    )?;
+                    for (channel_id, channel) in channels_local {
+                        let channel = channel.blocking_lock();
+                        for message_id in channel.message_ids.iter() {
+                            insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
+                        }
+                        update_last_seen.execute(params![
+                            channel.last_seen_message.map(|id| id.0 as i64),
+                            channel_id.0 as i64,
+                        ])?;
+                    }
+                    drop(insert_id);
+                    drop(update_last_seen);
+                    tx.commit()?;
+                    println!("Saved message IDs");
+                    Ok(())
+                })
+                .await
+                .unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    });
+}
+
 async fn event_event_handler(
     ctx: &serenity::prelude::Context,
     event: &poise::Event<'_>,
@@ -654,44 +696,7 @@ async fn main() {
         channels,
     };
 
-    // setup a task to save the message IDs periodically
-    let channels = data.channels.clone();
-    tokio::spawn(async move {
-        let db_connection = Connection::open("autodelete.db").await.unwrap();
-        loop {
-            let channels_local = channels.to_cloned_vec().await;
-            db_connection
-                .call(move |conn| {
-                    let tx = conn.transaction()?;
-                    tx.execute("DELETE FROM message_ids", [])?;
-                    let mut insert_id = tx.prepare(
-                        "INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)",
-                    )?;
-                    let mut update_last_seen = tx.prepare(
-                        "UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?",
-                    )?;
-                    for (channel_id, channel) in channels_local {
-                        let channel = channel.blocking_lock();
-                        for message_id in channel.message_ids.iter() {
-                            insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
-                        }
-                        update_last_seen.execute(params![
-                            channel.last_seen_message.map(|id| id.0 as i64),
-                            channel_id.0 as i64,
-                        ])?;
-                    }
-                    drop(insert_id);
-                    drop(update_last_seen);
-                    tx.commit()?;
-                    println!("Saved message IDs");
-                    Ok(())
-                })
-                .await
-                .unwrap();
-
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        }
-    });
+    save_task(data.channels.clone());
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
