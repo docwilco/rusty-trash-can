@@ -1,3 +1,5 @@
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 /// A Discord bot that deletes messages after a certain amount of time or when a maximum number of messages is reached.
 ///
 /// This is inspired by https://github.com/riking/AutoDelete
@@ -14,11 +16,8 @@
 /// * Put delete queues back into message id lists when shutting down
 use itertools::Itertools;
 use poise::say_reply;
-use poise::serenity_prelude::{CacheHttp, Http, MessageId, StatusCode, Timestamp};
+use poise::serenity_prelude::{CacheHttp, ChannelId, GatewayIntents, Http, MessageId, Mutex, RwLock, StatusCode, Timestamp};
 use rusqlite::params;
-use serenity::model::prelude::{ChannelId, GatewayIntents};
-use serenity::prelude::{Mutex, RwLock};
-use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -45,16 +44,17 @@ impl Display for Direction {
 }
 
 #[derive(Debug, Default)]
-struct Channel {
+struct ChannelInner {
     max_age: Option<Duration>,
     max_messages: Option<u64>,
     message_ids: VecDeque<MessageId>,
     delete_queue: Vec<MessageId>,
     last_seen_message: Option<MessageId>,
     bot_start_message: Option<MessageId>,
+    stop_tasks: bool,
 }
 
-impl Channel {
+impl ChannelInner {
     fn check_expiry(&mut self) {
         if let Some(max_age) = self.max_age {
             let now = OffsetDateTime::now_utc();
@@ -98,13 +98,67 @@ impl Channel {
             }
         }
     }
+
 }
 
 #[derive(Clone, Debug, Default)]
-struct Channels(Arc<RwLock<HashMap<ChannelId, Arc<Mutex<Channel>>>>>);
+struct Channel(Arc<Mutex<ChannelInner>>);
+
+impl Channel {
+    // Background task to delete messages
+    // This is intentionally separate from the delete queue, to try and get as
+    // few actual delete calls as possible, using bulk deletes.
+    async fn delete_task(self, http: Arc<Http>, channel_id: ChannelId) {
+        tokio::spawn(async move {
+            loop {
+                let mut delete_queue_local = Vec::new();
+                let mut channel_guard = self.0.lock().await;
+                delete_queue_local.append(&mut channel_guard.delete_queue);
+                drop(channel_guard);
+                // Messages older than two weeks can't be bulk deleted, so split
+                // the queue into two parts
+                let two_weeks_ago = Timestamp::from(
+                    // Take one hour off to avoid race conditions with clocks that are
+                    // a little (up to an hour) out of sync.
+                    OffsetDateTime::now_utc() - Duration::weeks(2) + Duration::hours(1),
+                );
+                let delete_queue_non_bulk = delete_queue_local
+                    .iter()
+                    .filter(|x| x.created_at() <= two_weeks_ago)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let delete_queue_bulk = delete_queue_local
+                    .into_iter()
+                    .filter(|x| x.created_at() > two_weeks_ago)
+                    .collect::<Vec<_>>();
+                for message_id in delete_queue_non_bulk {
+                    delete_message(&http, channel_id, message_id, &self).await;
+                }
+                for chunk in delete_queue_bulk.chunks(100) {
+                    match chunk.len() {
+                        1 => {
+                            delete_message(&http, channel_id, chunk[0], &self).await;
+                        }
+                        _ => {
+                            let result = channel_id.delete_messages(&http, chunk.iter()).await;
+                            if result.is_err() {
+                                println!("Error deleting messages: {:?}", result);
+                                self.0.lock().await.delete_queue.extend(chunk);
+                            }
+                        }
+                    }
+                }
+                sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Channels(Arc<RwLock<HashMap<ChannelId, Channel>>>);
 
 impl Channels {
-    async fn get_or_default(&self, channel_id: ChannelId) -> Arc<Mutex<Channel>> {
+    async fn get_or_default(&self, http: Arc<Http>, channel_id: ChannelId) -> Channel {
         // Most get() calls will be for channels that already exist, so we
         // use read() first to avoid locking write(). Bind the guard so we
         // can explicitly drop it before locking write() if needed. Without
@@ -113,23 +167,28 @@ impl Channels {
         match channels_guard.get(&channel_id).cloned() {
             Some(channel) => channel,
             None => {
-                let channel = Arc::new(Mutex::new(Channel::default()));
+                let channel = Channel(Arc::new(Mutex::new(ChannelInner::default())));
                 drop(channels_guard);
+                channel.clone().delete_task(http, channel_id).await;
                 self.0.write().await.insert(channel_id, channel.clone());
                 channel
             }
         }
     }
 
-    async fn get(&self, channel_id: ChannelId) -> Option<Arc<Mutex<Channel>>> {
+    async fn get(&self, channel_id: ChannelId) -> Option<Channel> {
         self.0.read().await.get(&channel_id).cloned()
     }
 
-    async fn remove(&self, channel_id: ChannelId) -> Option<Arc<Mutex<Channel>>> {
-        self.0.write().await.remove(&channel_id)
+    async fn remove(&self, channel_id: ChannelId) -> Option<Channel> {
+        let channel = self.0.write().await.remove(&channel_id);
+        if let Some(ref channel) = channel {
+            channel.0.lock().await.stop_tasks = true;
+        }
+        channel
     }
 
-    async fn to_cloned_vec(&self) -> Vec<(ChannelId, Arc<Mutex<Channel>>)> {
+    async fn to_cloned_vec(&self) -> Vec<(ChannelId, Channel)> {
         self.0
             .read()
             .await
@@ -148,7 +207,7 @@ struct Data {
 async fn fetch_message_history(
     http: impl AsRef<Http>,
     channel_id: ChannelId,
-    channel: Arc<Mutex<Channel>>,
+    channel: Channel,
     direction: Direction,
     message_id: Option<MessageId>,
 ) -> Result<(), Error> {
@@ -185,47 +244,44 @@ async fn fetch_message_history(
         } else {
             origin = Some(messages.last().unwrap().id);
         }
-        let message_ids: Vec<MessageId> = messages.into_iter().map(|m| m.id).collect();
+        let mut message_ids: Vec<MessageId> = messages.into_iter().map(|m| m.id).collect();
         println!(
             "Fetched {} messages for channel {}",
             message_ids.len(),
             channel_id
         );
-        // Let's check some assumptions
-        let mut sorted_ids = message_ids.clone();
-        sorted_ids.sort_unstable_by_key(|w| Reverse(w.0));
-        if sorted_ids != message_ids {
-            println!("Messages (history) were not returned in order");
-        }
-        sorted_ids.dedup();
-        if sorted_ids != message_ids {
-            println!("Messages (history) were not unique");
-        }
+
         // Add to the channel's data
         // The messages are currently going from newest to oldest, but we want
         // them in the opposite order, because that's how the channel data has
         // them.
-        sorted_ids.reverse();
-        let mut ids = VecDeque::from(sorted_ids);
-        let mut channel_guard = channel.lock().await;
-        if direction == Direction::Before {
-            // We're getting history from before what we know, so put
-            // the new messages at the front. Do that by appending what
-            // we might have to the just retrieved messages, and then
-            // putting the whole result back.
-            // With the extra append, I'm not sure this is actually faster
-            // than just relying on the sort.
-            ids.append(&mut channel_guard.message_ids);
+        message_ids.reverse();
+        // Convert to a VecDeque so we can use `append()` for speed
+        let mut ids = VecDeque::from(message_ids);
+        let mut channel_guard = channel.0.lock().await;
+        // Combine with existing message ids, but remove duplicates that might
+        // have been added by the message event handler while we were
+        // retrieving history.
+        match direction {
+            Direction::Before => {
+                // We're getting history from before what we know, so put
+                // the new messages at the front. Do that by appending what
+                // we might have to the just retrieved messages.
+                // There used to be code here, but it turned out After does
+                // everything Before does, just one thing extra, so nothing
+                // inside the match remains.
+            }
+            Direction::After => {
+                // We're getting history from after what we know, so put
+                // the new messages at the end. Do that by appending to the
+                // channel metadata, and then deduping the whole thing.
+                // A benchmark showed that this is faster than using the code
+                // from the Before branch, despite the extra `append()`.
+                channel_guard.message_ids.append(&mut ids);
+            }
         }
-        channel_guard.message_ids.append(&mut ids);
-        // Remove duplicates that might have been added by the message
-        // event handler while we were retrieving history. Do the dedup
-        // after the append, because the append might not be going into
-        // an empty list. (In the case of After).
-        // Sort, then copy back into ids, so we can use into_iter().dedup()
-        // back into the channel metadata.
-        channel_guard.message_ids.make_contiguous().sort_unstable();
         ids.append(&mut channel_guard.message_ids);
+        ids.make_contiguous().sort_unstable();
         channel_guard.message_ids.extend(ids.into_iter().dedup());
         channel_guard.check_max_messages();
     }
@@ -276,8 +332,9 @@ async fn start(
     if max_age.is_none() && max_messages.is_none() {
         return Err("Must specify at least one of max messages or max age".into());
     }
-    let channel = ctx.data().channels.get_or_default(ctx.channel_id()).await;
-    let mut channel_guard = channel.lock().await;
+    let http = Arc::new(*(ctx.http()).clone());
+    let channel = ctx.data().channels.get_or_default(http, ctx.channel_id()).await;
+    let mut channel_guard = channel.0.lock().await;
     let was_inactive = channel_guard.max_age.is_none() && channel_guard.max_messages.is_none();
     channel_guard.max_age = max_age;
     channel_guard.max_messages = max_messages;
@@ -340,7 +397,7 @@ async fn start(
 
     if was_inactive {
         fetch_message_history(
-            &ctx.http(),
+            ctx.http(),
             channel_id,
             channel,
             Direction::Before,
@@ -398,7 +455,7 @@ async fn status(ctx: Context<'_>) -> Result<(), Error> {
     let channel = ctx.data().channels.get(ctx.channel_id()).await;
     let message = match channel {
         Some(channel) => {
-            let channel_guard = channel.lock().await;
+            let channel_guard = channel.0.lock().await;
             match (channel_guard.max_age, channel_guard.max_messages) {
                 (Some(max_age), Some(max_messages)) => {
                     format!("max age: {}, max messages: {}", max_age, max_messages)
@@ -418,7 +475,7 @@ async fn delete_message(
     http: &Http,
     channel_id: ChannelId,
     message_id: MessageId,
-    channel: &Arc<Mutex<Channel>>,
+    channel: &Channel,
 ) {
     let delete = channel_id.delete_message(http, message_id).await;
     match delete {
@@ -428,7 +485,7 @@ async fn delete_message(
         }
         Err(e) => {
             eprintln!("Error deleting message: {}", e);
-            channel.lock().await.delete_queue.push(message_id);
+            channel.0.lock().await.delete_queue.push(message_id);
         }
         Ok(_) => {}
     }
@@ -442,60 +499,24 @@ fn expire_task(channels: Channels) {
             interval.tick().await;
             // snag a copy of the message_ids_map
             let channels_local = channels.to_cloned_vec().await;
-            for (_, channel) in channels_local.into_iter() {
-                let mut channel = channel.lock().await;
-                channel.check_expiry();
-            }
+            let futures: FuturesUnordered<_> = channels_local
+                .into_iter()
+                .map(|(_, channel)| async move {
+                    let mut channel = channel.0.lock().await;
+                    channel.check_expiry();
+                })
+                .collect();
+            let _ = futures.collect::<Vec<_>>().await;
         }
     });
 }
 
-// Background task to delete messages
-// This is intentionally separate
-fn delete_task(http: Arc<Http>, channels: Channels) {
+fn start_delete_tasks(http: Arc<Http>, channels: Channels) {
     tokio::spawn(async move {
         loop {
             sleep(std::time::Duration::from_millis(500)).await;
             let channels_local = channels.to_cloned_vec().await;
-            for (channel_id, channel) in channels_local.into_iter() {
-                let mut delete_queue_local = Vec::new();
-                let mut channel_guard = channel.lock().await;
-                delete_queue_local.append(&mut channel_guard.delete_queue);
-                drop(channel_guard);
-                // Messages older than two weeks can't be bulk deleted, so split
-                // the queue into two parts
-                let two_weeks_ago = Timestamp::from(
-                    // Take one hour off to avoid race conditions with clocks that are
-                    // a little (up to an hour) out of sync.
-                    OffsetDateTime::now_utc() - Duration::weeks(2) + Duration::hours(1),
-                );
-                let delete_queue_non_bulk = delete_queue_local
-                    .iter()
-                    .filter(|x| x.created_at() <= two_weeks_ago)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let delete_queue_bulk = delete_queue_local
-                    .into_iter()
-                    .filter(|x| x.created_at() > two_weeks_ago)
-                    .collect::<Vec<_>>();
-                for message_id in delete_queue_non_bulk {
-                    delete_message(&http, channel_id, message_id, &channel).await;
-                }
-                for chunk in delete_queue_bulk.chunks(100) {
-                    match chunk.len() {
-                        1 => {
-                            delete_message(&http, channel_id, chunk[0], &channel).await;
-                        }
-                        _ => {
-                            let result = channel_id.delete_messages(&http, chunk.iter()).await;
-                            if result.is_err() {
-                                println!("Error deleting messages: {:?}", result);
-                                channel.lock().await.delete_queue.extend(chunk);
-                            }
-                        }
-                    }
-                }
-            }
+            for (channel_id, channel) in channels_local.into_iter() {}
         }
     });
 }
@@ -519,7 +540,7 @@ fn save_task(channels: Channels) {
                         "UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?",
                     )?;
                     for (channel_id, channel) in channels_local {
-                        let channel = channel.blocking_lock();
+                        let channel = channel.0.blocking_lock();
                         for message_id in channel.message_ids.iter() {
                             insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
                         }
@@ -554,13 +575,13 @@ async fn event_event_handler(
             let http = ctx.http.clone();
             let channels = user_data.channels.clone();
 
-            delete_task(http.clone(), channels.clone());
+            start_delete_tasks(http.clone(), channels.clone());
             expire_task(channels);
 
             // Catch up on messages that have happened since the bot was last online
             let channels = user_data.channels.to_cloned_vec().await;
             for (channel_id, channel) in channels {
-                let channel_guard = channel.lock().await;
+                let channel_guard = channel.0.lock().await;
                 let last_seen = channel_guard.last_seen_message;
                 drop(channel_guard);
                 let http = http.clone();
@@ -577,7 +598,7 @@ async fn event_event_handler(
                 Some(channel) => channel,
                 None => return Ok(()),
             };
-            let mut channel = channel.lock().await;
+            let mut channel = channel.0.lock().await;
             if channel.max_age.is_none() && channel.max_messages.is_none() {
                 return Ok(());
             }
@@ -617,7 +638,7 @@ async fn main() {
             )?;
             let mut channel_settings =
                 conn.prepare("SELECT channel_id, max_age, max_messages, last_seen_message, bot_start_message FROM channel_settings")?;
-            let channel_settings: HashMap<ChannelId, Channel> = channel_settings
+            let channel_settings: HashMap<ChannelId, ChannelInner> = channel_settings
                 .query_map([], |row| {
                     let channel_id: i64 = row.get(0)?;
                     let max_age: Option<i64> = row.get(1)?;
@@ -626,7 +647,7 @@ async fn main() {
                     let bot_start_message: Option<i64> = row.get(4)?;
                     Ok((
                         ChannelId(channel_id as u64),
-                        Channel {
+                        ChannelInner {
                             max_age: max_age.map(Duration::seconds),
                             max_messages: max_messages.map(|x| x as u64),
                             last_seen_message: last_seen_message.map(|id| MessageId::from(id as u64)),
@@ -635,7 +656,7 @@ async fn main() {
                         },
                     ))
                 })?
-                .collect::<Result<HashMap<ChannelId, Channel>, rusqlite::Error>>()?;
+                .collect::<Result<HashMap<ChannelId, ChannelInner>, rusqlite::Error>>()?;
             Ok(channel_settings)
         })
         .await
@@ -677,9 +698,9 @@ async fn main() {
         .into_iter()
         .map(|(channel_id, mut channel)| {
             channel.message_ids = message_ids.remove(&channel_id).unwrap_or_default();
-            (channel_id, Arc::new(Mutex::new(channel)))
+            (channel_id, Channel(Arc::new(Mutex::new(channel))))
         })
-        .collect::<HashMap<ChannelId, Arc<Mutex<Channel>>>>();
+        .collect::<HashMap<ChannelId, Channel>>();
 
     let channels = Channels(Arc::new(RwLock::new(channels)));
     // background task for periodic saving
