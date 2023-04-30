@@ -58,40 +58,21 @@ impl ChannelInner {
         if let Some(max_age) = self.max_age {
             let now = OffsetDateTime::now_utc();
             let oldest_allowed = Timestamp::from(now - max_age);
-            let mut keep = VecDeque::new();
-            let mut ids = self.message_ids.iter();
-            loop {
-                let id = ids.next();
-                if id.is_none() {
-                    break;
-                }
-                let id = id.unwrap();
-                if let Some(bot_start_message) = self.bot_start_message {
-                    if *id == bot_start_message {
-                        // We want to keep the bot's start message, so just ignore its
-                        // existence and continue to the next message.
-                        // It could have been added by a fetch of history.
-                        continue;
-                    }
-                }
-                if id.created_at() < oldest_allowed {
-                    self.delete_queue.push(*id);
+            while let Some(first) = self.message_ids.front() {
+                if first.created_at() < oldest_allowed {
+                    self.delete_queue
+                        .push(self.message_ids.pop_front().unwrap());
                 } else {
-                    keep.push_back(*id);
-                    // messages should be sorted by timestamp, so we can stop here
-                    // and extend() with remainder
+                    // messages should be sorted by timestamp, so we can stop here.
                     break;
                 }
             }
-            keep.extend(ids);
-            self.message_ids.clear();
-            self.message_ids.append(&mut keep);
         }
     }
 
     fn check_max_messages(&mut self) {
         if let Some(max_messages) = self.max_messages {
-            for _ in 0..self.message_ids.len() as isize - max_messages as isize {
+            while self.message_ids.len() > max_messages as usize {
                 self.delete_queue
                     .push(self.message_ids.pop_front().unwrap());
             }
@@ -132,9 +113,6 @@ impl Channel {
                     .into_iter()
                     .filter(|x| x.created_at() > two_weeks_ago)
                     .collect::<Vec<_>>();
-                for message_id in delete_queue_non_bulk {
-                    delete_message(&http, channel_id, message_id, &self).await;
-                }
                 for chunk in delete_queue_bulk.chunks(100) {
                     match chunk.len() {
                         1 => {
@@ -147,6 +125,15 @@ impl Channel {
                                 self.0.lock().await.delete_queue.extend(chunk);
                             }
                         }
+                    }
+                }
+                if !delete_queue_non_bulk.is_empty() {
+                    println!(
+                        "Deleting {} messages that are older than two weeks",
+                        delete_queue_non_bulk.len()
+                    );
+                    for message_id in delete_queue_non_bulk {
+                        delete_message(&http, channel_id, message_id, &self).await;
                     }
                 }
                 sleep(std::time::Duration::from_secs(1)).await;
