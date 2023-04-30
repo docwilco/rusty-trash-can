@@ -1,5 +1,3 @@
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 /// A Discord bot that deletes messages after a certain amount of time or when a maximum number of messages is reached.
 ///
 /// This is inspired by https://github.com/riking/AutoDelete
@@ -9,14 +7,15 @@ use futures::StreamExt;
 /// * Uses slash commands in addition to regular commands
 ///
 /// TODO:
-/// * Support for rate limiting
 /// * Spruce up the help text
 /// * Maybe an admin HTTP server with some status info
 /// * Catch signals and do a graceful shutdown
 /// * Put delete queues back into message id lists when shutting down
 use itertools::Itertools;
 use poise::say_reply;
-use poise::serenity_prelude::{CacheHttp, ChannelId, GatewayIntents, Http, MessageId, Mutex, RwLock, StatusCode, Timestamp};
+use poise::serenity_prelude::{
+    CacheHttp, ChannelId, GatewayIntents, Http, MessageId, Mutex, RwLock, StatusCode, Timestamp,
+};
 use rusqlite::params;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
@@ -98,7 +97,6 @@ impl ChannelInner {
             }
         }
     }
-
 }
 
 #[derive(Clone, Debug, Default)]
@@ -108,11 +106,14 @@ impl Channel {
     // Background task to delete messages
     // This is intentionally separate from the delete queue, to try and get as
     // few actual delete calls as possible, using bulk deletes.
-    async fn delete_task(self, http: Arc<Http>, channel_id: ChannelId) {
+    fn delete_task(self, http: Arc<Http>, channel_id: ChannelId) {
         tokio::spawn(async move {
             loop {
                 let mut delete_queue_local = Vec::new();
                 let mut channel_guard = self.0.lock().await;
+                if channel_guard.stop_tasks {
+                    break;
+                }
                 delete_queue_local.append(&mut channel_guard.delete_queue);
                 drop(channel_guard);
                 // Messages older than two weeks can't be bulk deleted, so split
@@ -152,6 +153,28 @@ impl Channel {
             }
         });
     }
+
+    // background task to put expired messages in the delete queue
+    fn expire_task(self) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let mut channel = self.0.lock().await;
+                if channel.stop_tasks {
+                    break;
+                }
+                channel.check_expiry();
+            }
+        });
+    }
+
+    fn new(http: Arc<Http>, channel_id: ChannelId, inner: ChannelInner) -> Self {
+        let channel = Channel(Arc::new(Mutex::new(inner)));
+        channel.clone().expire_task();
+        channel.clone().delete_task(http, channel_id);
+        channel
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,18 +182,15 @@ struct Channels(Arc<RwLock<HashMap<ChannelId, Channel>>>);
 
 impl Channels {
     async fn get_or_default(&self, http: Arc<Http>, channel_id: ChannelId) -> Channel {
-        // Most get() calls will be for channels that already exist, so we
-        // use read() first to avoid locking write(). Bind the guard so we
-        // can explicitly drop it before locking write() if needed. Without
-        // the explicit drop, we would get a deadlock.
-        let channels_guard = self.0.read().await;
-        match channels_guard.get(&channel_id).cloned() {
+        // Since this is only called when changing a channel's setting now,
+        // we can just lock with `write()`, and not worry about race conditions
+        // between the `get()` and `insert()`.
+        let mut channels = self.0.write().await;
+        match channels.get(&channel_id).cloned() {
             Some(channel) => channel,
             None => {
-                let channel = Channel(Arc::new(Mutex::new(ChannelInner::default())));
-                drop(channels_guard);
-                channel.clone().delete_task(http, channel_id).await;
-                self.0.write().await.insert(channel_id, channel.clone());
+                let channel = Channel::new(http, channel_id, ChannelInner::default());
+                channels.insert(channel_id, channel.clone());
                 channel
             }
         }
@@ -332,8 +352,12 @@ async fn start(
     if max_age.is_none() && max_messages.is_none() {
         return Err("Must specify at least one of max messages or max age".into());
     }
-    let http = Arc::new(*(ctx.http()).clone());
-    let channel = ctx.data().channels.get_or_default(http, ctx.channel_id()).await;
+    let http = ctx.serenity_context().http.clone();
+    let channel = ctx
+        .data()
+        .channels
+        .get_or_default(http, ctx.channel_id())
+        .await;
     let mut channel_guard = channel.0.lock().await;
     let was_inactive = channel_guard.max_age.is_none() && channel_guard.max_messages.is_none();
     channel_guard.max_age = max_age;
@@ -491,38 +515,9 @@ async fn delete_message(
     }
 }
 
-// background task to put expired messages in the delete queue
-fn expire_task(channels: Channels) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            // snag a copy of the message_ids_map
-            let channels_local = channels.to_cloned_vec().await;
-            let futures: FuturesUnordered<_> = channels_local
-                .into_iter()
-                .map(|(_, channel)| async move {
-                    let mut channel = channel.0.lock().await;
-                    channel.check_expiry();
-                })
-                .collect();
-            let _ = futures.collect::<Vec<_>>().await;
-        }
-    });
-}
-
-fn start_delete_tasks(http: Arc<Http>, channels: Channels) {
-    tokio::spawn(async move {
-        loop {
-            sleep(std::time::Duration::from_millis(500)).await;
-            let channels_local = channels.to_cloned_vec().await;
-            for (channel_id, channel) in channels_local.into_iter() {}
-        }
-    });
-}
-
 // Task to save the message IDs periodically
-// Since this doesn't need a Discord context, it can be started from main()
+// This works on all channels in one sweep, to minimize the number of database
+// calls. And also to have the disk writes be grouped together.
 fn save_task(channels: Channels) {
     tokio::spawn(async move {
         // Use a separate connection for the save task
@@ -532,6 +527,8 @@ fn save_task(channels: Channels) {
             db_connection
                 .call(move |conn| {
                     let tx = conn.transaction()?;
+                    // Delete instead of truncate, so the transaction can be
+                    // rolled back.
                     tx.execute("DELETE FROM message_ids", [])?;
                     let mut insert_id = tx.prepare(
                         "INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)",
@@ -573,10 +570,6 @@ async fn event_event_handler(
         poise::Event::Ready { data_about_bot } => {
             println!("{} is connected!", data_about_bot.user.name);
             let http = ctx.http.clone();
-            let channels = user_data.channels.clone();
-
-            start_delete_tasks(http.clone(), channels.clone());
-            expire_task(channels);
 
             // Catch up on messages that have happened since the bot was last online
             let channels = user_data.channels.to_cloned_vec().await;
@@ -694,22 +687,6 @@ async fn main() {
         .await
         .unwrap();
 
-    let channels = channels
-        .into_iter()
-        .map(|(channel_id, mut channel)| {
-            channel.message_ids = message_ids.remove(&channel_id).unwrap_or_default();
-            (channel_id, Channel(Arc::new(Mutex::new(channel))))
-        })
-        .collect::<HashMap<ChannelId, Channel>>();
-
-    let channels = Channels(Arc::new(RwLock::new(channels)));
-    // background task for periodic saving
-    save_task(channels.clone());
-    let data = Data {
-        db_connection: Arc::new(Mutex::new(db_connection)),
-        channels,
-    };
-
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![autodelete()],
@@ -730,6 +707,25 @@ async fn main() {
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+
+                // Converting from ChannelInner to Channel requires the Http client, so we do it here
+                let channels = channels
+                    .into_iter()
+                    .map(|(channel_id, mut inner)| {
+                        inner.message_ids = message_ids.remove(&channel_id).unwrap_or_default();
+                        (
+                            channel_id,
+                            Channel::new(ctx.http.clone(), channel_id, inner),
+                        )
+                    })
+                    .collect::<HashMap<ChannelId, Channel>>();
+                let channels = Channels(Arc::new(RwLock::new(channels)));
+                // background task for periodic saving
+                save_task(channels.clone());
+                let data = Data {
+                    db_connection: Arc::new(Mutex::new(db_connection)),
+                    channels,
+                };
                 Ok(data)
             })
         });
