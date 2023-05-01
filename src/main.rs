@@ -104,15 +104,9 @@ impl Channel {
                     // a little (up to an hour) out of sync.
                     OffsetDateTime::now_utc() - Duration::weeks(2) + Duration::hours(1),
                 );
-                let delete_queue_non_bulk = delete_queue_local
-                    .iter()
-                    .filter(|x| x.created_at() <= two_weeks_ago)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let delete_queue_bulk = delete_queue_local
+                let (delete_queue_non_bulk, delete_queue_bulk) = delete_queue_local
                     .into_iter()
-                    .filter(|x| x.created_at() > two_weeks_ago)
-                    .collect::<Vec<_>>();
+                    .partition::<Vec<_>, _>(|x| x.created_at() <= two_weeks_ago);
                 for chunk in delete_queue_bulk.chunks(100) {
                     match chunk.len() {
                         1 => {
