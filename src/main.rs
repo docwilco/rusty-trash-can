@@ -289,30 +289,40 @@ async fn fetch_message_history(
     Ok(())
 }
 
-/// The bot's main entry point
+async fn show_help(ctx: Context<'_>, command: Option<String>) -> Result<(), Error> {
+    let config = poise::builtins::HelpConfiguration {
+        show_subcommands: true,
+        ..Default::default()
+    };
+    poise::builtins::help(ctx, command.as_deref(), config).await?;
+    Ok(())
+}
+
 #[poise::command(
     prefix_command,
     slash_command,
     subcommands("start", "stop", "status", "help")
 )]
+/// The bot's main entry point
 async fn autodelete(ctx: Context<'_>) -> Result<(), Error> {
-    poise::builtins::help(ctx, None, Default::default()).await?;
-    Ok(())
+    show_help(ctx, None).await
 }
 
 /// Show help for the autodelete command
 #[poise::command(prefix_command, slash_command)]
-async fn help(ctx: Context<'_>) -> Result<(), Error> {
-    poise::builtins::help(ctx, None, Default::default()).await?;
-    Ok(())
+async fn help(
+    ctx: Context<'_>,
+    #[description = "Specific command to show help about"] command: Option<String>,
+) -> Result<(), Error> {
+    show_help(ctx, command).await
 }
 
-/// Update autodelete settings for the current channel
 #[poise::command(
     slash_command,
     prefix_command,
     required_permissions = "MANAGE_MESSAGES"
 )]
+/// Update autodelete settings for the current channel
 async fn start(
     ctx: Context<'_>,
     #[description = "Max age of messages"] max_age: Option<String>,
@@ -413,12 +423,12 @@ async fn start(
     Ok(())
 }
 
-/// Stop autodelete for the current channel
 #[poise::command(
     slash_command,
     prefix_command,
     required_permissions = "MANAGE_MESSAGES"
 )]
+/// Stop autodelete for the current channel
 async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     let channel = ctx.data().channels.remove(ctx.channel_id()).await;
     // Remove from database
@@ -450,12 +460,12 @@ async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Show autodelete settings for the current channel
 #[poise::command(
     slash_command,
     prefix_command,
     required_permissions = "MANAGE_MESSAGES"
 )]
+/// Show autodelete settings for the current channel
 async fn status(ctx: Context<'_>) -> Result<(), Error> {
     let channel = ctx.data().channels.get(ctx.channel_id()).await;
     let message = match channel {
