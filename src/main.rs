@@ -7,10 +7,9 @@
 /// * Uses slash commands in addition to regular commands
 ///
 /// TODO:
-/// * Spruce up the help text
-/// * Maybe an admin HTTP server with some status info
 /// * Catch signals and do a graceful shutdown
 /// * Put delete queues back into message id lists when shutting down
+/// * Maybe an admin HTTP server with some status info
 use itertools::Itertools;
 use poise::say_reply;
 use poise::serenity_prelude::{
@@ -289,7 +288,16 @@ async fn fetch_message_history(
     Ok(())
 }
 
-async fn show_help(ctx: Context<'_>, command: Option<String>) -> Result<(), Error> {
+async fn show_help(ctx: Context<'_>, mut command: Option<String>) -> Result<(), Error> {
+    // This makes it possible to just make `help` a subcommand of any command
+    // `/autodelete help` turns into `/help autodelete`
+    // `/autodelete help start` turns into `/help autodelete start`
+    if ctx.invoked_command_name() != "help" {
+        command = match command {
+            Some(c) => Some(format!("{} {}", ctx.invoked_command_name(), c)),
+            None => Some(ctx.invoked_command_name().to_string()),
+        };
+    }
     let config = poise::builtins::HelpConfiguration {
         show_subcommands: true,
         ..Default::default()
@@ -317,12 +325,29 @@ async fn help(
     show_help(ctx, command).await
 }
 
+/// Set or update autodelete settings for the current channel
+///
+/// This command has 2 arguments:
+/// 
+/// `max_age`: The maximum age of messages to keep. Use a number followed by a
+/// unit (`s` or `second`, `m` or `minute`, `h` or `hour`, `d` or `day`).
+/// `max_messages`: The maximum number of messages to keep.
+///
+/// Both are optional, but at least one is required.
+///
+/// Note that using a `max_age` of 14 days (`14d`) or higher is not recommended,
+/// as Discord does not allow bulk deleting messages older than 14 days. It will
+/// still work, but it might be slower due to Discord's rate limits.
+///
+/// Likewise, using a `max_messages` with a high number, without `max_age` for a
+/// busy channel can also run into rate limits.
+///
+/// This command requires the `MANAGE_MESSAGES` permission.
 #[poise::command(
     slash_command,
     prefix_command,
     required_permissions = "MANAGE_MESSAGES"
 )]
-/// Update autodelete settings for the current channel
 async fn start(
     ctx: Context<'_>,
     #[description = "Max age of messages"] max_age: Option<String>,
@@ -429,6 +454,12 @@ async fn start(
     required_permissions = "MANAGE_MESSAGES"
 )]
 /// Stop autodelete for the current channel
+/// 
+/// Avoid stopping just to start with different settings, as all the message
+/// history will be deleted when stopping. Meaning that it will have to be
+/// retrieved again when setting up autodelete again.
+/// 
+/// Of course, this could be desirable, if the bot has lost track of things.
 async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     let channel = ctx.data().channels.remove(ctx.channel_id()).await;
     // Remove from database
