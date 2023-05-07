@@ -7,8 +7,8 @@
 /// * Uses slash commands in addition to regular commands
 ///
 /// TODO:
-/// * Catch signals and do a graceful shutdown
 /// * Put delete queues back into message id lists when shutting down
+/// * Prettier logging
 /// * Maybe an admin HTTP server with some status info
 use itertools::Itertools;
 use poise::say_reply;
@@ -328,7 +328,7 @@ async fn help(
 /// Set or update autodelete settings for the current channel
 ///
 /// This command has 2 arguments:
-/// 
+///
 /// `max_age`: The maximum age of messages to keep. Use a number followed by a
 /// unit (`s` or `second`, `m` or `minute`, `h` or `hour`, `d` or `day`).
 /// `max_messages`: The maximum number of messages to keep.
@@ -454,11 +454,11 @@ async fn start(
     required_permissions = "MANAGE_MESSAGES"
 )]
 /// Stop autodelete for the current channel
-/// 
+///
 /// Avoid stopping just to start with different settings, as all the message
 /// history will be deleted when stopping. Meaning that it will have to be
 /// retrieved again when setting up autodelete again.
-/// 
+///
 /// Of course, this could be desirable, if the bot has lost track of things.
 async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     let channel = ctx.data().channels.remove(ctx.channel_id()).await;
@@ -546,40 +546,43 @@ fn save_task(channels: Channels) {
         let db_connection = Connection::open("autodelete.db").await.unwrap();
         loop {
             let channels_local = channels.to_cloned_vec().await;
-            db_connection
-                .call(move |conn| {
-                    let tx = conn.transaction()?;
-                    // Delete instead of truncate, so the transaction can be
-                    // rolled back.
-                    tx.execute("DELETE FROM message_ids", [])?;
-                    let mut insert_id = tx.prepare(
-                        "INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)",
-                    )?;
-                    let mut update_last_seen = tx.prepare(
-                        "UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?",
-                    )?;
-                    for (channel_id, channel) in channels_local {
-                        let channel = channel.0.blocking_lock();
-                        for message_id in channel.message_ids.iter() {
-                            insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
-                        }
-                        update_last_seen.execute(params![
-                            channel.last_seen_message.map(|id| id.0 as i64),
-                            channel_id.0 as i64,
-                        ])?;
-                    }
-                    drop(insert_id);
-                    drop(update_last_seen);
-                    tx.commit()?;
-                    println!("Saved message IDs");
-                    Ok(())
-                })
-                .await
-                .unwrap();
+            save_message_ids(&db_connection, channels_local).await;
+            println!("Saved message IDs");
 
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
     });
+}
+
+async fn save_message_ids(db_connection: &Connection, channels_local: Vec<(ChannelId, Channel)>) {
+    db_connection
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            // Delete instead of truncate, so the transaction can be
+            // rolled back.
+            tx.execute("DELETE FROM message_ids", [])?;
+            let mut insert_id =
+                tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
+            let mut update_last_seen = tx.prepare(
+                "UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?",
+            )?;
+            for (channel_id, channel) in channels_local {
+                let channel = channel.0.blocking_lock();
+                for message_id in channel.message_ids.iter() {
+                    insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
+                }
+                update_last_seen.execute(params![
+                    channel.last_seen_message.map(|id| id.0 as i64),
+                    channel_id.0 as i64,
+                ])?;
+            }
+            drop(insert_id);
+            drop(update_last_seen);
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
 }
 
 async fn event_event_handler(
@@ -631,6 +634,49 @@ async fn event_event_handler(
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_termination() {
+    let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate()).unwrap();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_termination() {
+    let mut ctrl_break = tokio::signal::windows::ctrl_break().unwrap();
+    let mut ctrl_c = tokio::signal::windows::ctrl_c().unwrap();
+    let mut ctrl_close = tokio::signal::windows::ctrl_close().unwrap();
+    let mut ctrl_logoff = tokio::signal::windows::ctrl_logoff().unwrap();
+    let mut ctrl_shutdown = tokio::signal::windows::ctrl_shutdown().unwrap();
+    tokio::select! {
+        _ = ctrl_break.recv() => {}
+        _ = ctrl_c.recv() => {}
+        _ = ctrl_close.recv() => {}
+        _ = ctrl_logoff.recv() => {}
+        _ = ctrl_shutdown.recv() => {}
+    }
+}
+
+async fn exit_handler(channels: Channels, db_connection: Connection) {
+    tokio::spawn(async move {
+        wait_for_termination().await;
+        println!("Signal received, shutting down.");
+        // We hang on to the write lock until the end of the function, so
+        // that nothing can be added, nor that the periodic save task can
+        // run before we exit.
+        let channels_guard = channels.0.write().await;
+        let channels_local = channels_guard
+            .iter()
+            .map(|(id, channel)| (*id, channel.clone()))
+            .collect::<Vec<_>>();
+        save_message_ids(&db_connection, channels_local).await;
+        println!("Saved message IDs, exiting.");
+        std::process::exit(0);
+    });
 }
 
 #[tokio::main]
@@ -744,6 +790,7 @@ async fn main() {
                 let channels = Channels(Arc::new(RwLock::new(channels)));
                 // background task for periodic saving
                 save_task(channels.clone());
+                exit_handler(channels.clone(), db_connection.clone()).await;
                 let data = Data {
                     db_connection: Arc::new(Mutex::new(db_connection)),
                     channels,
