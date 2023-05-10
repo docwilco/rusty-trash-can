@@ -7,7 +7,6 @@
 /// * Uses slash commands in addition to regular commands
 ///
 /// TODO:
-/// * Put delete queues back into message id lists when shutting down
 /// * Maybe an admin HTTP server with some status info
 use itertools::Itertools;
 use log::{debug, error, info, warn};
@@ -50,6 +49,8 @@ struct ChannelInner {
     last_seen_message: Option<MessageId>,
     bot_start_message: Option<MessageId>,
     stop_tasks: bool,
+    delete_task_stopped: bool,
+    expire_task_stopped: bool,
 }
 
 impl ChannelInner {
@@ -95,6 +96,7 @@ impl Channel {
                 let mut channel_guard = self.0.lock().await;
                 if channel_guard.stop_tasks {
                     debug!("Stopping delete task for channel {}", channel_id);
+                    channel_guard.delete_task_stopped = true;
                     break;
                 }
                 delete_queue_local.append(&mut channel_guard.delete_queue);
@@ -149,6 +151,7 @@ impl Channel {
                 let mut channel = self.0.lock().await;
                 if channel.stop_tasks {
                     debug!("Stopping expire task for channel {}", channel_id);
+                    channel.expire_task_stopped = true;
                     break;
                 }
                 channel.check_expiry();
@@ -587,6 +590,7 @@ async fn save_message_ids(db_connection: &Connection, channels_local: Vec<(Chann
             for (channel_id, channel) in channels_local {
                 debug!("Saving message IDs for {}", channel_id);
                 let channel = channel.0.blocking_lock();
+                debug!("Saving {} message IDs for {}", channel.message_ids.len(), channel_id);
                 for message_id in channel.message_ids.iter() {
                     insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
                 }
@@ -712,6 +716,34 @@ async fn exit_handler(channels: Channels, db_connection: Connection) {
             .iter()
             .map(|(id, channel)| (*id, channel.clone()))
             .collect::<Vec<_>>();
+        // Stop the tasks on the channels
+        debug!("Stopping tasks");
+        for (_, channel) in channels_local.iter() {
+            let mut channel = channel.0.lock().await;
+            channel.stop_tasks = true;
+        }
+        // Wait for all the channels' tasks to finish
+        debug!("Waiting for tasks to finish");
+        for (_, channel) in channels_local.iter() {
+            loop {
+                let channel = channel.0.lock().await;
+                if channel.delete_task_stopped && channel.expire_task_stopped {
+                    break;
+                }
+                drop(channel);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        debug!("Tasks finished");
+        // Return messages from delete queues to message IDs
+        debug!("Returning messages from delete queues");
+        for (channel_id, channel) in channels_local.iter() {
+            let mut channel = channel.0.lock().await;
+            debug!("Channel {} has {} messages in delete queue", channel_id, channel.delete_queue.len());
+            while let Some(message_id) = channel.delete_queue.pop() {
+                channel.message_ids.push_back(message_id);
+            }
+        }
         save_message_ids(&db_connection, channels_local).await;
         warn!("Saved message IDs, exiting due to signal.");
         std::process::exit(0);
@@ -780,7 +812,10 @@ async fn main() {
                 [],
             )?;
             let mut message_ids_query =
-                conn.prepare("SELECT channel_id, message_id FROM message_ids")?;
+                conn.prepare(
+                    "SELECT channel_id, message_id
+                        FROM message_ids
+                        ORDER BY channel_id, message_id")?;
             let mut message_ids: HashMap<ChannelId, VecDeque<MessageId>> = HashMap::new();
             for row in message_ids_query.query_map([], |row| {
                 let channel_id: i64 = row.get(0)?;
