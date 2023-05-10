@@ -8,7 +8,6 @@
 ///
 /// TODO:
 /// * Put delete queues back into message id lists when shutting down
-/// * Prettier logging
 /// * Maybe an admin HTTP server with some status info
 use itertools::Itertools;
 use log::{debug, error, info, warn};
