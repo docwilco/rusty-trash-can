@@ -11,6 +11,7 @@
 /// * Prettier logging
 /// * Maybe an admin HTTP server with some status info
 use itertools::Itertools;
+use log::{debug, error, info, warn};
 use poise::say_reply;
 use poise::serenity_prelude::{
     CacheHttp, ChannelId, GatewayIntents, Http, MessageId, Mutex, RwLock, StatusCode, Timestamp,
@@ -59,6 +60,7 @@ impl ChannelInner {
             let oldest_allowed = Timestamp::from(now - max_age);
             while let Some(first) = self.message_ids.front() {
                 if first.created_at() < oldest_allowed {
+                    debug!("Expiring message {}(msg_timestamp={} expire_time={})", first, first.created_at(), oldest_allowed);
                     self.delete_queue
                         .push(self.message_ids.pop_front().unwrap());
                 } else {
@@ -88,10 +90,12 @@ impl Channel {
     // few actual delete calls as possible, using bulk deletes.
     fn delete_task(self, http: Arc<Http>, channel_id: ChannelId) {
         tokio::spawn(async move {
+            debug!("Starting delete task for channel {}", channel_id);
             loop {
                 let mut delete_queue_local = Vec::new();
                 let mut channel_guard = self.0.lock().await;
                 if channel_guard.stop_tasks {
+                    debug!("Stopping delete task for channel {}", channel_id);
                     break;
                 }
                 delete_queue_local.append(&mut channel_guard.delete_queue);
@@ -112,16 +116,18 @@ impl Channel {
                             delete_message(&http, channel_id, chunk[0], &self).await;
                         }
                         _ => {
+                            debug!("Deleting {} messages in bulk (max per request is 100)", chunk.len());
                             let result = channel_id.delete_messages(&http, chunk.iter()).await;
                             if result.is_err() {
-                                println!("Error deleting messages: {:?}", result);
+                                error!("Error deleting messages: {:?}", result);
+                                debug!("Putting messages back into delete queue");
                                 self.0.lock().await.delete_queue.extend(chunk);
                             }
                         }
                     }
                 }
                 if !delete_queue_non_bulk.is_empty() {
-                    println!(
+                    warn!(
                         "Deleting {} messages that are older than two weeks",
                         delete_queue_non_bulk.len()
                     );
@@ -135,13 +141,15 @@ impl Channel {
     }
 
     // background task to put expired messages in the delete queue
-    fn expire_task(self) {
+    fn expire_task(self, channel_id: ChannelId) {
         tokio::spawn(async move {
+            debug!("Starting expire task for channel {}", channel_id);
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;
                 let mut channel = self.0.lock().await;
                 if channel.stop_tasks {
+                    debug!("Stopping expire task for channel {}", channel_id);
                     break;
                 }
                 channel.check_expiry();
@@ -151,7 +159,7 @@ impl Channel {
 
     fn new(http: Arc<Http>, channel_id: ChannelId, inner: ChannelInner) -> Self {
         let channel = Channel(Arc::new(Mutex::new(inner)));
-        channel.clone().expire_task();
+        channel.clone().expire_task(channel_id);
         channel.clone().delete_task(http, channel_id);
         channel
     }
@@ -211,7 +219,7 @@ async fn fetch_message_history(
     direction: Direction,
     message_id: Option<MessageId>,
 ) -> Result<(), Error> {
-    println!(
+    info!(
         "Fetching message history for channel {}. Requesting messages {} {}",
         channel_id,
         direction,
@@ -245,7 +253,7 @@ async fn fetch_message_history(
             origin = Some(messages.last().unwrap().id);
         }
         let mut message_ids: Vec<MessageId> = messages.into_iter().map(|m| m.id).collect();
-        println!(
+        info!(
             "Fetched {} messages for channel {}",
             message_ids.len(),
             channel_id
@@ -403,6 +411,7 @@ async fn start(
                     bot_start_message.map(|x| x.0 as i64),
                 ],
             )?;
+            debug!("Updated channel settings for {} in database", channel_id);
             Ok(())
         })
         .await?;
@@ -414,6 +423,7 @@ async fn start(
         (Some(max_age), None) => format!("max age: {}", max_age),
         (None, None) => unreachable!(),
     };
+    info!("Settings updated for {}: {}", channel_id, message);
     let message = format!("Autodelete settings updated: {}", message);
     let reply = say_reply(ctx, message).await?;
     let reply_id = reply.message().await?.id;
@@ -431,11 +441,13 @@ async fn start(
                 "UPDATE channel_settings SET bot_start_message = ? WHERE channel_id = ?",
                 params![reply_id.0 as i64, channel_id.0 as i64],
             )?;
+            debug!("Updated bot_start_message for {} to {} in database", channel_id, reply_id);
             Ok(())
         })
         .await?;
 
     if was_inactive {
+        info!("Channel {} wasn't autodeleting, fetching message history", channel_id);
         fetch_message_history(
             ctx.http(),
             channel_id,
@@ -480,6 +492,7 @@ async fn stop(ctx: Context<'_>) -> Result<(), Error> {
                 params![channel_id.0 as i64],
             )?;
             tx.commit()?;
+            debug!("Deleted channel {} from database", channel_id);
             Ok(())
         })
         .await?;
@@ -487,6 +500,7 @@ async fn stop(ctx: Context<'_>) -> Result<(), Error> {
         Some(_) => "Autodelete stopped",
         None => "Autodelete was not active",
     };
+    info!("{} for {}", message, channel_id);
     say_reply(ctx, message).await?;
     Ok(())
 }
@@ -513,6 +527,7 @@ async fn status(ctx: Context<'_>) -> Result<(), Error> {
         }
         None => "Autodelete is not active".to_string(),
     };
+    debug!("Status for {}: {}", ctx.channel_id(), message);
     say_reply(ctx, message).await?;
     Ok(())
 }
@@ -523,14 +538,16 @@ async fn delete_message(
     message_id: MessageId,
     channel: &Channel,
 ) {
+    debug!("Deleting message {}", message_id);
     let delete = channel_id.delete_message(http, message_id).await;
     match delete {
         Err(serenity::Error::Http(e)) if e.status_code() == Some(StatusCode::NOT_FOUND) => {
             // Message was already deleted
-            println!("404: Message {} was already deleted", message_id);
+            warn!("404: Message {} was already deleted", message_id);
         }
         Err(e) => {
-            eprintln!("Error deleting message: {}", e);
+            error!("Error deleting message: {}", e);
+            debug!("Returning message to queue");
             channel.0.lock().await.delete_queue.push(message_id);
         }
         Ok(_) => {}
@@ -543,11 +560,13 @@ async fn delete_message(
 fn save_task(channels: Channels) {
     tokio::spawn(async move {
         // Use a separate connection for the save task
+        debug!("Starting save task");
         let db_connection = Connection::open("autodelete.db").await.unwrap();
         loop {
+            debug!("Saving message IDs");
             let channels_local = channels.to_cloned_vec().await;
             save_message_ids(&db_connection, channels_local).await;
-            println!("Saved message IDs");
+            info!("Saved message IDs");
 
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
@@ -567,14 +586,17 @@ async fn save_message_ids(db_connection: &Connection, channels_local: Vec<(Chann
                 "UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?",
             )?;
             for (channel_id, channel) in channels_local {
+                debug!("Saving message IDs for {}", channel_id);
                 let channel = channel.0.blocking_lock();
                 for message_id in channel.message_ids.iter() {
                     insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
                 }
+                debug!("Updating last seen message for {}", channel_id);
                 update_last_seen.execute(params![
                     channel.last_seen_message.map(|id| id.0 as i64),
                     channel_id.0 as i64,
                 ])?;
+                debug!("Channel {} done saving", channel_id);
             }
             drop(insert_id);
             drop(update_last_seen);
@@ -593,7 +615,7 @@ async fn event_event_handler(
 ) -> Result<(), Error> {
     match event {
         poise::Event::Ready { data_about_bot } => {
-            println!("{} is connected!", data_about_bot.user.name);
+            info!("{} is connected!", data_about_bot.user.name);
             let http = ctx.http.clone();
 
             // Catch up on messages that have happened since the bot was last online
@@ -611,18 +633,22 @@ async fn event_event_handler(
             }
         }
         poise::Event::Message { new_message } => {
+            debug!("Received message {} on {}", new_message.id, new_message.channel_id);
             let channel = user_data.channels.get(new_message.channel_id).await;
             let channel = match channel {
                 Some(channel) => channel,
-                None => return Ok(()),
+                None => {
+                    debug!("Ignoring message in channel without settings");
+                    return Ok(())},
             };
             let mut channel = channel.0.lock().await;
             if channel.max_age.is_none() && channel.max_messages.is_none() {
+                debug!("Ignoring message in channel without both maxes (shouldn't happen?)");
                 return Ok(());
             }
             if let Some(bot_start_message) = channel.bot_start_message {
                 if bot_start_message == new_message.id {
-                    println!("Ignoring bot start message");
+                    debug!("Ignoring bot start message");
                     return Ok(());
                 }
             }
@@ -640,8 +666,12 @@ async fn event_event_handler(
 async fn wait_for_termination() {
     let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate()).unwrap();
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
+        _ = tokio::signal::ctrl_c() => {
+            debug!("Received Ctrl+C");
+        }
+        _ = sigterm.recv() => {
+            debug!("Received SIGTERM");
+        }
     }
 }
 
@@ -653,18 +683,28 @@ async fn wait_for_termination() {
     let mut ctrl_logoff = tokio::signal::windows::ctrl_logoff().unwrap();
     let mut ctrl_shutdown = tokio::signal::windows::ctrl_shutdown().unwrap();
     tokio::select! {
-        _ = ctrl_break.recv() => {}
-        _ = ctrl_c.recv() => {}
-        _ = ctrl_close.recv() => {}
-        _ = ctrl_logoff.recv() => {}
-        _ = ctrl_shutdown.recv() => {}
+        _ = ctrl_break.recv() => {
+            debug!("Received Ctrl+Break");
+        }
+        _ = ctrl_c.recv() => {
+            debug!("Received Ctrl+C");
+        }
+        _ = ctrl_close.recv() => {
+            debug!("Received Ctrl+Close");
+        }
+        _ = ctrl_logoff.recv() => {
+            debug!("Received Ctrl+Logoff");
+        }
+        _ = ctrl_shutdown.recv() => {
+            debug!("Received Ctrl+Shutdown");
+        }
     }
 }
 
 async fn exit_handler(channels: Channels, db_connection: Connection) {
     tokio::spawn(async move {
         wait_for_termination().await;
-        println!("Signal received, shutting down.");
+        info!("Signal received, shutting down.");
         // We hang on to the write lock until the end of the function, so
         // that nothing can be added, nor that the periodic save task can
         // run before we exit.
@@ -674,7 +714,7 @@ async fn exit_handler(channels: Channels, db_connection: Connection) {
             .map(|(id, channel)| (*id, channel.clone()))
             .collect::<Vec<_>>();
         save_message_ids(&db_connection, channels_local).await;
-        println!("Saved message IDs, exiting.");
+        warn!("Saved message IDs, exiting due to signal.");
         std::process::exit(0);
     });
 }
@@ -682,6 +722,8 @@ async fn exit_handler(channels: Channels, db_connection: Connection) {
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().ok();
+    env_logger::init();
+    info!("Starting up");
 
     let db_connection = Connection::open("autodelete.db").await.unwrap();
 
@@ -722,9 +764,10 @@ async fn main() {
         })
         .await
         .unwrap();
-    println!("Channel settings:");
+    info!("Loaded channel settings from database");
+    debug!("Channel settings:");
     channels.iter().for_each(|(k, v)| {
-        println!("{}: {:?}", k, v);
+        debug!("{}: {:?}", k, v);
     });
 
     let mut message_ids = db_connection
@@ -749,7 +792,8 @@ async fn main() {
                 let message_ids = message_ids.entry(channel_id).or_default();
                 message_ids.push_back(message_id);
             }
-            println!("Loaded message IDs: {:?}", message_ids);
+            info!("Loaded message IDs from database");
+            debug!("Loaded message IDs: {:?}", message_ids);
             Ok(message_ids)
         })
         .await
@@ -798,5 +842,6 @@ async fn main() {
                 Ok(data)
             })
         });
+    info!("Initialization complete. Starting framework!");
     framework.run().await.unwrap();
 }
