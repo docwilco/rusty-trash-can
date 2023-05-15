@@ -12,7 +12,7 @@ use itertools::Itertools;
 use log::{debug, error, info, warn};
 use poise::say_reply;
 use poise::serenity_prelude::{
-    CacheHttp, ChannelId, GatewayIntents, Http, MessageId, Mutex, RwLock, StatusCode, Timestamp,
+    ChannelId, GatewayIntents, Http, MessageId, Mutex, RwLock, StatusCode, Timestamp,
 };
 use rusqlite::params;
 use std::collections::{HashMap, VecDeque};
