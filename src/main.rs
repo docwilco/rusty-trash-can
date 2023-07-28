@@ -19,6 +19,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
+#[cfg(unix)]
+use tokio::signal::unix::SignalKind;
 use tokio::time::sleep;
 use tokio_rusqlite::Connection;
 
