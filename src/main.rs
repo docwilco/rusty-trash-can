@@ -344,6 +344,7 @@ async fn fetch_message_history(
     message_id: Option<MessageId>,
 ) -> Result<(), Error> {
     let channel_id = channel.0.channel_id;
+    let bot_start_message = channel.0.inner.lock().await.bot_start_message;
     info!(
         "Fetching message history for channel {}. Requesting messages {} {}",
         channel_id,
@@ -377,7 +378,19 @@ async fn fetch_message_history(
         } else {
             origin = Some(messages.last().unwrap().id);
         }
-        let mut message_ids: Vec<MessageId> = messages.into_iter().map(|m| m.id).collect();
+        let mut message_ids: Vec<MessageId> = messages
+            .into_iter()
+            .map(|m| m.id)
+            .filter(|message_id| {
+                // Filter out the bot start message
+                if let Some(bot_start_message) = bot_start_message {
+                    if *message_id == bot_start_message {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
         info!(
             "Fetched {} messages for channel {}",
             message_ids.len(),
@@ -1035,10 +1048,7 @@ async fn main() {
             ..Default::default()
         })
         .token(std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN"))
-        .intents(
-            GatewayIntents::GUILD_MESSAGES
-                | GatewayIntents::GUILDS,
-        )
+        .intents(GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS)
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
