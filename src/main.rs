@@ -380,15 +380,14 @@ async fn fetch_message_history(
         }
         let mut message_ids: Vec<MessageId> = messages
             .into_iter()
-            .map(|m| m.id)
-            .filter(|message_id| {
+            .filter_map(|m| {
                 // Filter out the bot start message
                 if let Some(bot_start_message) = bot_start_message {
-                    if *message_id == bot_start_message {
-                        return false;
+                    if m.id == bot_start_message {
+                        return None;
                     }
                 }
-                true
+                Some(m.id)
             })
             .collect();
         info!(
