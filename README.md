@@ -2,8 +2,8 @@
 
 ## Usage
 
-Invite using: https://discord.com/oauth2/authorize?client_id=1093263866126942208&permissions=76800&scope=bot 
-Control using `/autodelete` commands
+1. Invite using: https://discord.com/oauth2/authorize?client_id=1093263866126942208&permissions=76800&scope=bot 
+2. Control using `/autodelete` commands
 
 ## Running your own
 
