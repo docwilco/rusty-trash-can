@@ -396,6 +396,8 @@ async fn fetch_message_history(
             channel_id
         );
 
+        // Log to database
+        log_message_ids(db_connection.clone(), channel_id, &message_ids).await.expect("Error logging to database");
         // Add to the channel's data
         // The messages are currently going from newest to oldest, but we want
         // them in the opposite order, because that's how the channel data has
@@ -856,10 +858,58 @@ async fn event_event_handler(
                 // MAX duration, so notify the task to wake up.
                 channel.0.expire_notify.notify_one();
             }
+
+            log_message_id(user_data, new_message.channel_id, new_message.id).await?;
         }
         _ => (),
     }
 
+    Ok(())
+}
+
+async fn log_message_id(
+    data: &Data,
+    channel_id: ChannelId,
+    message_id: MessageId,
+) -> Result<(), Error> {
+    data.db_connection
+        .lock()
+        .await
+        .call(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO message_log (channel_id, message_id) VALUES (?, ?)",
+                params![channel_id.0 as i64, message_id.0 as i64],
+            )?;
+            debug!("Logged message {} to database", message_id);
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
+async fn log_message_ids(
+    db_connection: Arc<Mutex<Connection>>,
+    channel_id: ChannelId,
+    message_ids: &[MessageId],
+) -> Result<(), Error> {
+    let message_ids = message_ids.to_vec();
+    db_connection
+        .lock()
+        .await
+        .call(move |conn| {
+            let tx = conn.transaction()?;
+            let mut statement = tx.prepare(
+                "INSERT OR IGNORE INTO message_log (channel_id, message_id) VALUES (?, ?)",
+            )?;
+            for message_id in message_ids {
+                statement.execute(params![channel_id.0 as i64, message_id.0 as i64])?;
+            }
+            drop(statement);
+            tx.commit()?;
+            debug!("Saved messages to log");
+            Ok(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -1034,6 +1084,21 @@ async fn main() {
             info!("Loaded message IDs from database");
             debug!("Loaded message IDs: {:?}", message_ids);
             Ok(message_ids)
+        })
+        .await
+        .unwrap();
+
+    db_connection
+        .call(|conn| {
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS message_log (
+                channel_id INTEGER,
+                message_id INTEGER,
+                PRIMARY KEY (channel_id, message_id)
+            )",
+                [],
+            )?;
+            Ok(())
         })
         .await
         .unwrap();
