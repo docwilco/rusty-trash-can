@@ -15,6 +15,7 @@ use poise::serenity_prelude::{
     ChannelId, GatewayIntents, Http, MessageId, Mutex, RwLock, StatusCode, Timestamp,
 };
 use rusqlite::params;
+use rusqlite::Error::SqliteFailure;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -44,12 +45,36 @@ impl Display for Direction {
     }
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Message {
+    id: MessageId,
+    attachments: bool,
+    embeds: bool,
+}
+
+impl Display for Message {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id)?;
+        if self.attachments {
+            write!(f, " (attachments)")?;
+        }
+        if self.embeds {
+            write!(f, " (embeds)")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default)]
 struct ChannelInner {
     max_age: Option<Duration>,
     max_messages: Option<u64>,
-    message_ids: VecDeque<MessageId>,
-    delete_queue: Vec<MessageId>,
+    attachments_max_age: Option<Duration>,
+    attachments_max_messages: Option<u64>,
+    embeds_max_age: Option<Duration>,
+    embeds_max_messages: Option<u64>,
+    messages: VecDeque<Message>,
+    delete_queue: Vec<Message>,
     last_seen_message: Option<MessageId>,
     bot_start_message: Option<MessageId>,
     stop_tasks: bool,
@@ -73,20 +98,19 @@ impl ChannelInner {
         if let Some(max_age) = self.max_age {
             let now = OffsetDateTime::now_utc();
             let oldest_allowed = Timestamp::from(now - max_age);
-            while let Some(first) = self.message_ids.front() {
-                if first.created_at() < oldest_allowed {
+            while let Some(first) = self.messages.front() {
+                if first.id.created_at() < oldest_allowed {
                     debug!(
                         "Expiring message {}(msg_timestamp={} expire_time={})",
-                        first,
-                        first.created_at(),
+                        first.id,
+                        first.id.created_at(),
                         oldest_allowed
                     );
-                    self.delete_queue
-                        .push(self.message_ids.pop_front().unwrap());
+                    self.delete_queue.push(self.messages.pop_front().unwrap());
                     expired += 1;
                 } else {
                     // Deref gives the OffsetDateTime, which implements Add & Sub
-                    let to_next = *first.created_at() + max_age - now;
+                    let to_next = *first.id.created_at() + max_age - now;
                     // It has to be in the future, because it's not expired yet
                     assert!(to_next > Duration::ZERO);
                     duration_to_next = Some(to_next.unsigned_abs());
@@ -101,9 +125,8 @@ impl ChannelInner {
     fn check_max_messages(&mut self) -> usize {
         let mut moved_to_delete_queue = 0;
         if let Some(max_messages) = self.max_messages {
-            while self.message_ids.len() > max_messages as usize {
-                self.delete_queue
-                    .push(self.message_ids.pop_front().unwrap());
+            while self.messages.len() > max_messages as usize {
+                self.delete_queue.push(self.messages.pop_front().unwrap());
                 // If there's a max_age, the expire task might wake up
                 // too early now, but the way to update it is to wake it up.
                 // So leave as is for now.
@@ -176,12 +199,12 @@ impl Channel {
                 let mut progress: usize = 0;
                 let (delete_queue_non_bulk, delete_queue_bulk) = delete_queue_local
                     .into_iter()
-                    .partition::<Vec<_>, _>(|x| x.created_at() <= two_weeks_ago);
+                    .partition::<Vec<_>, _>(|x| x.id.created_at() <= two_weeks_ago);
                 for chunk in delete_queue_bulk.chunks(100) {
                     let mut channel_guard = self.0.inner.lock().await;
                     if stopping || channel_guard.check_stopped(channel_id) {
                         stopping = true;
-                        channel_guard.delete_queue.extend(chunk);
+                        channel_guard.delete_queue.extend(chunk.into_iter().cloned());
                         // not break, because we want further chunks returned as well
                         continue;
                     }
@@ -360,9 +383,9 @@ async fn fetch_message_history(
         direction
     };
     loop {
-        // These requests are automatically rate limited by serenity, so it
-        // can take a while to fetch a lot of messages. Put them in our channel
-        // metadata as we get each chunk.
+        // These requests are automatically rate limited by serenity (and
+        // Discord), so it can take a while to fetch a lot of messages. Put them
+        // in our channel metadata as we get each chunk.
         let messages = channel_id
             .messages(&http, |b| match (origin, direction) {
                 (Some(origin), Direction::After) => b.after(origin).limit(100),
@@ -378,7 +401,7 @@ async fn fetch_message_history(
         } else {
             origin = Some(messages.last().unwrap().id);
         }
-        let mut message_ids: Vec<MessageId> = messages
+        let mut messages: Vec<Message> = messages
             .into_iter()
             .filter_map(|m| {
                 // Filter out the bot start message
@@ -387,24 +410,30 @@ async fn fetch_message_history(
                         return None;
                     }
                 }
-                Some(m.id)
+                Some(Message {
+                    id: m.id,
+                    attachments: !m.attachments.is_empty(),
+                    embeds: !m.embeds.is_empty(),
+                })
             })
             .collect();
         info!(
             "Fetched {} messages for channel {}",
-            message_ids.len(),
+            messages.len(),
             channel_id
         );
 
         // Log to database
-        log_message_ids(db_connection.clone(), channel_id, &message_ids).await.expect("Error logging to database");
+        log_message_ids(db_connection.clone(), channel_id, &messages)
+            .await
+            .expect("Error logging to database");
         // Add to the channel's data
         // The messages are currently going from newest to oldest, but we want
         // them in the opposite order, because that's how the channel data has
         // them.
-        message_ids.reverse();
+        messages.reverse();
         // Convert to a VecDeque so we can use `append()` for speed
-        let mut ids = VecDeque::from(message_ids);
+        let mut ids = VecDeque::from(messages);
         let mut channel_guard = channel.0.inner.lock().await;
         // Combine with existing message ids, but remove duplicates that might
         // have been added by the message event handler while we were
@@ -424,12 +453,12 @@ async fn fetch_message_history(
                 // channel metadata, and then deduping the whole thing.
                 // A benchmark showed that this is faster than using the code
                 // from the Before branch, despite the extra `append()`.
-                channel_guard.message_ids.append(&mut ids);
+                channel_guard.messages.append(&mut ids);
             }
         }
-        ids.append(&mut channel_guard.message_ids);
+        ids.append(&mut channel_guard.messages);
         ids.make_contiguous().sort_unstable();
-        channel_guard.message_ids.extend(ids.into_iter().dedup());
+        channel_guard.messages.extend(ids.into_iter().dedup());
         channel_guard.check_max_messages();
         if !channel_guard.delete_queue.is_empty() {
             channel.0.delete_notify.notify_one();
@@ -671,22 +700,22 @@ async fn status(ctx: Context<'_>) -> Result<(), Error> {
 async fn delete_message(
     http: &Http,
     channel_id: ChannelId,
-    message_id: MessageId,
+    message: Message,
     channel: &Channel,
     progress: &usize,
     total: &usize,
 ) {
-    debug!("Deleting message {} [{}/{}]", message_id, progress, total);
-    let delete = channel_id.delete_message(http, message_id).await;
+    debug!("Deleting message {} [{}/{}]", message, progress, total);
+    let delete = channel_id.delete_message(http, message.id).await;
     match delete {
         Err(serenity::Error::Http(e)) if e.status_code() == Some(StatusCode::NOT_FOUND) => {
             // Message was already deleted
-            warn!("404: Message {} was already deleted", message_id);
+            warn!("404: Message {} was already deleted", message);
         }
         Err(e) => {
             error!("Error deleting message: {}", e);
             debug!("Returning message to queue");
-            channel.0.inner.lock().await.delete_queue.push(message_id);
+            channel.0.inner.lock().await.delete_queue.push(message);
             channel.0.delete_notify.notify_one();
         }
         Ok(_) => {}
@@ -732,9 +761,9 @@ async fn save_message_ids(db_connection: Arc<Mutex<Connection>>, channel: Channe
                 [channel_id.0 as i64],
             )?;
             let mut insert_id =
-                tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
-            for message_id in channel_guard.message_ids.iter() {
-                insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
+                tx.prepare("INSERT INTO message_ids (channel_id, message_id, attachments, embeds) VALUES (?, ?, ?, ?)")?;
+            for message in channel_guard.messages.iter() {
+                insert_id.execute(params![channel_id.0 as i64, message.id.0 as i64, message.attachments, message.embeds])?;
             }
             drop(insert_id);
             tx.commit()?;
@@ -754,8 +783,8 @@ async fn save_all_message_ids(
     // Using for loop because async closures aren't stable yet
     for (channel_id, channel) in &channels_local {
         let channel_guard = channel.0.inner.lock().await;
-        for message_id in &channel_guard.message_ids {
-            all_ids.push((*channel_id, *message_id));
+        for message_id in &channel_guard.messages {
+            all_ids.push((*channel_id, message_id.clone()));
         }
         all_last_seens.push((*channel_id, channel_guard.last_seen_message));
     }
@@ -767,12 +796,12 @@ async fn save_all_message_ids(
             // rolled back.
             tx.execute("DELETE FROM message_ids", [])?;
             let mut insert_id =
-                tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
+                tx.prepare("INSERT INTO message_ids (channel_id, message_id, attachments, embeds) VALUES (?, ?, ?, ?)")?;
             let mut update_last_seen = tx.prepare(
                 "UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?",
             )?;
-            for (channel_id, message_id) in &all_ids {
-                insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
+            for (channel_id, message) in &all_ids {
+                insert_id.execute(params![channel_id.0 as i64, message.id.0 as i64, message.attachments, message.embeds])?;
             }
             for (channel_id, last_seen) in &all_last_seens {
                 update_last_seen.execute(params![
@@ -822,10 +851,25 @@ async fn event_event_handler(
             }
         }
         poise::Event::Message { new_message } => {
+            let embeds_len = new_message.embeds.len();
+            let attachments_len = new_message.attachments.len();
             debug!(
-                "Received message {} on channel {}",
-                new_message.id, new_message.channel_id
+                "Received message {} on channel {}: {} ({} embeds, {} attachments)",
+                new_message.id,
+                new_message.channel_id,
+                new_message.content,
+                embeds_len,
+                attachments_len
             );
+            for (index, embed) in new_message.embeds.iter().enumerate() {
+                debug!("  Embed[{}/{}]: {:?}", index, embeds_len, embed);
+            }
+            for (index, attachment) in new_message.attachments.iter().enumerate() {
+                debug!(
+                    "  Attachment[{}/{}]: {:?}",
+                    index, attachments_len, attachment
+                );
+            }
             let channel = user_data.channels.get(new_message.channel_id).await;
             let channel = match channel {
                 Some(channel) => channel,
@@ -846,8 +890,12 @@ async fn event_event_handler(
                 }
             }
             channel_guard.last_seen_message = Some(new_message.id);
-            let was_empty = channel_guard.message_ids.is_empty();
-            channel_guard.message_ids.push_back(new_message.id);
+            let was_empty = channel_guard.messages.is_empty();
+            channel_guard.messages.push_back(Message {
+                id: new_message.id,
+                attachments: !new_message.attachments.is_empty(),
+                embeds: !new_message.embeds.is_empty(),
+            });
             channel_guard.check_max_messages();
             if !channel_guard.delete_queue.is_empty() {
                 channel.0.delete_notify.notify_one();
@@ -890,9 +938,9 @@ async fn log_message_id(
 async fn log_message_ids(
     db_connection: Arc<Mutex<Connection>>,
     channel_id: ChannelId,
-    message_ids: &[MessageId],
+    messages: &[Message],
 ) -> Result<(), Error> {
-    let message_ids = message_ids.to_vec();
+    let messages = messages.to_vec();
     db_connection
         .lock()
         .await
@@ -901,8 +949,8 @@ async fn log_message_ids(
             let mut statement = tx.prepare(
                 "INSERT OR IGNORE INTO message_log (channel_id, message_id) VALUES (?, ?)",
             )?;
-            for message_id in message_ids {
-                statement.execute(params![channel_id.0 as i64, message_id.0 as i64])?;
+            for message in messages {
+                statement.execute(params![channel_id.0 as i64, message.id.0 as i64])?;
             }
             drop(statement);
             tx.commit()?;
@@ -996,13 +1044,29 @@ async fn exit_handler(channels: Channels, db_connection: Connection) {
                 channel_guard.delete_queue.len()
             );
             while let Some(message_id) = channel_guard.delete_queue.pop() {
-                channel_guard.message_ids.push_back(message_id);
+                channel_guard.messages.push_back(message_id);
             }
         }
         save_all_message_ids(&db_connection, channels_local).await;
         warn!("Saved message IDs, exiting due to signal.");
         std::process::exit(0);
     });
+}
+
+fn try_sql(conn: &rusqlite::Connection, sql: &str) -> Result<(), rusqlite::Error> {
+    let result = conn.execute(sql, []);
+    if let Err(SqliteFailure(_, ref reason)) = result {
+        if reason
+            .as_ref()
+            .map(|s| s.contains("duplicate column"))
+            .unwrap_or(false)
+        {
+            debug!("Column attachments_max_age already exists, skipping");
+        } else {
+            return result.map(|_| ());
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -1025,22 +1089,62 @@ async fn main() {
                 )",
                 [],
             )?;
-            let mut channel_settings =
-                conn.prepare("SELECT channel_id, max_age, max_messages, last_seen_message, bot_start_message FROM channel_settings")?;
+            try_sql(
+                conn,
+                "ALTER TABLE channel_settings
+                ADD attachments_max_age INTEGER",
+            )?;
+            try_sql(
+                conn,
+                "ALTER TABLE channel_settings
+                ADD attachments_max_messages INTEGER",
+            )?;
+            try_sql(
+                conn,
+                "ALTER TABLE channel_settings
+                ADD embeds_max_age INTEGER",
+            )?;
+            try_sql(
+                conn,
+                "ALTER TABLE channel_settings
+                ADD embeds_max_messages INTEGER",
+            )?;
+            let mut channel_settings = conn.prepare(
+                "SELECT channel_id,
+                    max_age,
+                    max_messages,
+                    attachments_max_age,
+                    attachments_max_messages,					
+                    embeds_max_age,
+                    embeds_max_messages,
+                    last_seen_message,
+                    bot_start_message
+                    FROM channel_settings",
+            )?;
             let channel_settings: HashMap<ChannelId, ChannelInner> = channel_settings
                 .query_map([], |row| {
                     let channel_id: i64 = row.get(0)?;
                     let max_age: Option<i64> = row.get(1)?;
                     let max_messages: Option<i64> = row.get(2)?;
-                    let last_seen_message: Option<i64> = row.get(3)?;
-                    let bot_start_message: Option<i64> = row.get(4)?;
+                    let attachments_max_age: Option<i64> = row.get(3)?;
+                    let attachments_max_messages: Option<i64> = row.get(4)?;
+                    let embeds_max_age: Option<i64> = row.get(5)?;
+                    let embeds_max_messages: Option<i64> = row.get(6)?;
+                    let last_seen_message: Option<i64> = row.get(7)?;
+                    let bot_start_message: Option<i64> = row.get(8)?;
                     Ok((
                         ChannelId(channel_id as u64),
                         ChannelInner {
                             max_age: max_age.map(Duration::seconds),
                             max_messages: max_messages.map(|x| x as u64),
-                            last_seen_message: last_seen_message.map(|id| MessageId::from(id as u64)),
-                            bot_start_message: bot_start_message.map(|id| MessageId::from(id as u64)),
+                            attachments_max_age: attachments_max_age.map(Duration::seconds),
+                            attachments_max_messages: attachments_max_messages.map(|x| x as u64),
+                            embeds_max_age: embeds_max_age.map(Duration::seconds),
+                            embeds_max_messages: embeds_max_messages.map(|x| x as u64),
+                            last_seen_message: last_seen_message
+                                .map(|id| MessageId::from(id as u64)),
+                            bot_start_message: bot_start_message
+                                .map(|id| MessageId::from(id as u64)),
                             ..Default::default()
                         },
                     ))
@@ -1066,8 +1170,18 @@ async fn main() {
                 )",
                 [],
             )?;
+            try_sql(
+                conn,
+                "ALTER TABLE message_ids
+                ADD COLUMN attachments BOOLEAN",
+            )?;
+            try_sql(
+                conn,
+                "ALTER TABLE message_ids
+                ADD COLUMN embeds BOOLEAN",
+            )?;
             let mut message_ids_query = conn.prepare(
-                "SELECT channel_id, message_id
+                "SELECT channel_id, message_id, attachments, embeds
                         FROM message_ids
                         ORDER BY channel_id, message_id",
             )?;
@@ -1075,9 +1189,16 @@ async fn main() {
             for row in message_ids_query.query_map([], |row| {
                 let channel_id: i64 = row.get(0)?;
                 let message_id: i64 = row.get(1)?;
-                Ok((ChannelId(channel_id as u64), MessageId(message_id as u64)))
+                let attachments: Option<bool> = row.get(2)?;
+                let embeds: Option<bool> = row.get(3)?;
+                Ok((
+                    ChannelId(channel_id as u64),
+                    MessageId(message_id as u64),
+                    attachments.unwrap_or(false),
+                    embeds.unwrap_or(false),
+                ))
             })? {
-                let (channel_id, message_id) = row?;
+                let (channel_id, message_id, attachments, embeds) = row?;
                 let message_ids = message_ids.entry(channel_id).or_default();
                 message_ids.push_back(message_id);
             }
@@ -1112,7 +1233,11 @@ async fn main() {
             ..Default::default()
         })
         .token(std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN"))
-        .intents(GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS)
+        .intents(
+            GatewayIntents::GUILD_MESSAGES
+                | GatewayIntents::GUILDS
+                | GatewayIntents::MESSAGE_CONTENT,
+        )
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
@@ -1121,7 +1246,7 @@ async fn main() {
                 let channels = channels
                     .into_iter()
                     .map(|(channel_id, mut inner)| {
-                        inner.message_ids = message_ids.remove(&channel_id).unwrap_or_default();
+                        inner.messages = message_ids.remove(&channel_id).unwrap_or_default();
                         (
                             channel_id,
                             Channel::new(ctx.http.clone(), channel_id, inner),
