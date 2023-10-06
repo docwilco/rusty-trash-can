@@ -1,15 +1,12 @@
-use rusqlite::Connection;
 use crate::Error;
+use rusqlite::Connection;
 
-const VERSION_SCRIPTS: [&str; 2] = [
-    include_str!("schema_v1.sql"),
-    include_str!("schema_v2.sql"),
-];
+const VERSION_SCRIPTS: [&str; 2] = [include_str!("schema_v1.sql"), include_str!("schema_v2.sql")];
 
-pub fn check_and_upgrade_schema(conn: &Connection) -> Result<(), Error> {
+pub fn check_and_upgrade_schema(conn: &mut Connection) -> Result<(), Error> {
     // Get user_version pragma
     let user_version: usize = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if (user_version as usize) == VERSION_SCRIPTS.len() {
+    if user_version == VERSION_SCRIPTS.len() {
         // No need to upgrade
         return Ok(());
     }
@@ -19,8 +16,10 @@ pub fn check_and_upgrade_schema(conn: &Connection) -> Result<(), Error> {
         tx.execute_batch(script)?;
     }
     // Update pragma
-    tx.execute(&format!("PRAGMA user_version = {}", VERSION_SCRIPTS.len()), [])?;
+    tx.execute(
+        &format!("PRAGMA user_version = {}", VERSION_SCRIPTS.len()),
+        [],
+    )?;
     tx.commit()?;
     Ok(())
 }
-
