@@ -656,7 +656,6 @@ async fn start(
     let reply = say_reply(ctx, message).await?;
     let reply_id = reply.message().await?.id;
     let http = ctx.serenity_context().http.clone();
-    // XXX: what about execution from inside a thread?
     add_or_update_channel(
         http,
         ctx.data(),
