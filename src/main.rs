@@ -374,6 +374,84 @@ struct Data {
     message_logger: MessageLoggerTx,
 }
 
+async fn fetch_archived_threads(
+    http: Arc<Http>,
+    channel_id: ChannelId,
+    private: bool,
+) -> Result<Vec<GuildChannel>, Error> {
+    let mut before = None;
+    let mut threads = Vec::new();
+    loop {
+        let threadsdata = if private {
+            channel_id
+            .get_archived_private_threads(&http, before, None)
+            .await?
+        } else {
+            channel_id
+            .get_archived_public_threads(&http, before, None)
+            .await?
+        };
+        before = threadsdata.threads.last().map(|t| {
+            t.thread_metadata
+                .unwrap()
+                .archive_timestamp
+                .unwrap()
+                .unix_timestamp() as u64
+        });
+        threads.extend(threadsdata.threads);
+        if !threadsdata.has_more {
+            break;
+        }
+    }
+    Ok(threads)
+}
+
+#[async_recursion]
+async fn fetch_threads(
+    data: &Data,
+    http: Arc<Http>,
+    channel_id: ChannelId,
+    max_age: Option<Duration>,
+    max_messages: Option<u64>,
+) -> Result<(), Error> {
+    let guild_id = channel_id
+        .to_channel(&http)
+        .await?
+        .guild()
+        .unwrap()
+        .guild_id;
+
+    let threadsdata = guild_id.get_active_threads(&http).await?;
+    if threadsdata.has_more {
+        warn!("More threads than Discord returned, some might be missing. This shouldn't happen, please inform the developer at https://github.com/docwilco/rusty-trash-can/issues");
+    }
+    let active_threads = threadsdata.threads;
+    let archived_private_threads = fetch_archived_threads(http.clone(), channel_id, true).await?;
+    let archived_public_threads = fetch_archived_threads(http.clone(), channel_id, false).await?;
+
+    let threads = active_threads
+        .into_iter()
+        .chain(archived_private_threads)
+        .chain(archived_public_threads);
+    for thread in threads {
+        debug!("Checking thread {}", thread.id);
+        if thread.parent_id == Some(channel_id) {
+            debug!("Thread {} is a child of {}", thread.id, channel_id);
+            add_or_update_channel(
+                http.clone(),
+                data,
+                channel_id,
+                thread.parent_id,
+                max_age,
+                max_messages,
+                None,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_message_history(
     db_updater: DbUpdaterTx,
     message_logger: MessageLoggerTx,
@@ -607,7 +685,6 @@ async fn add_or_update_channel(
     channel_guard.max_messages = max_messages;
     channel_guard.bot_start_message = bot_start_message;
     // Get for write to database
-    let last_seen_message = channel_guard.last_seen_message;
     drop(channel_guard);
 
     data.db_updater.send(channel_id).unwrap();
@@ -617,6 +694,7 @@ async fn add_or_update_channel(
             "Channel {} wasn't autodeleting, fetching message history",
             channel_id
         );
+        fetch_threads(data, http.clone(), channel_id, max_age, max_messages).await?;
         fetch_message_history(
             data.db_updater.clone(),
             data.message_logger.clone(),
@@ -761,7 +839,9 @@ fn save_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
                         Ok(channel_id) => {
                             let channel = channels.blocking_get(channel_id);
                             if let Some(channel) = channel {
-                                save_channel(&mut db_connection, channel);
+                                save_channel(&mut db_connection, channel)?;
+                            } else {
+                                delete_channel(&mut db_connection, channel_id)?;
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -775,7 +855,7 @@ fn save_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
                 now = Instant::now();
                 if now >= next_save {
                     next_save += interval;
-                    save_all_message_ids(&db_connection, channels.blocking_to_cloned_vec());
+                    save_all_message_ids(&mut db_connection, channels.blocking_to_cloned_vec())?;
                 }
             }
             Ok(())
@@ -804,11 +884,27 @@ fn save_channel(db_connection: &mut Connection, channel: Channel) -> Result<(), 
     Ok(())
 }
 
+fn delete_channel(db_connection: &mut Connection, channel_id: ChannelId) -> Result<(), Error> {
+    debug!("Deleting settings & message IDs for {}", channel_id);
+    let tx = db_connection.transaction()?;
+    tx.execute(
+        "DELETE FROM message_ids WHERE channel_id = ?",
+        [channel_id.0 as i64],
+    )?;
+    tx.execute(
+        "DELETE FROM channel_settings WHERE channel_id = ?",
+        [channel_id.0 as i64],
+    )?;
+    tx.commit()?;
+    debug!("Channel {} done deleting", channel_id);
+    Ok(())
+}
+
 // This doesn't use `save_message_ids` so that the DELETE is a single statement
 // without WHERE clause, which sqlite can optimize. Also that way it's a single
 // transaction for the whole thing.
 fn save_all_message_ids(
-    db_connection: &Connection,
+    db_connection: &mut Connection,
     channels_local: Vec<(ChannelId, Channel)>,
 ) -> Result<(), Error> {
     // First we build up an in memory list of all data we want to save, so that
@@ -913,7 +1009,7 @@ async fn message_handler(data: &Data, new_message: &Message) -> Result<(), Error
     }
 
     data.message_logger
-        .send((new_message.channel_id, new_message.id));
+        .send((new_message.channel_id, new_message.id))?;
     Ok(())
 }
 
@@ -1024,8 +1120,9 @@ async fn wait_for_termination() {
     }
 }
 
-fn message_logger_thread(rx: MessageLoggerRx) {
+fn message_logger_thread(rx: StdMutex<MessageLoggerRx>) {
     thread::spawn(move || -> Result<(), Error> {
+        let rx = rx.lock().unwrap();
         let mut db_connection = Connection::open(DB_PATH)?;
         let mut ids = Vec::new();
         loop {
@@ -1053,7 +1150,7 @@ fn message_logger_thread(rx: MessageLoggerRx) {
 async fn exit_handler(channels: Channels) {
     tokio::spawn(async move {
         // This is not async, but we're at startup, so a hiccup is acceptable
-        let db_connection = Connection::open(DB_PATH).unwrap();
+        let mut db_connection = Connection::open(DB_PATH).unwrap();
         wait_for_termination().await;
         info!("Signal received, shutting down.");
         // We hang on to the write lock until the end of the function, so that
@@ -1084,7 +1181,7 @@ async fn exit_handler(channels: Channels) {
                 }
                 drop(channel_guard);
                 debug!("Waiting for tasks to finish (100ms sleep)");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(StdDuration::from_millis(100)).await;
             }
         }
         debug!("Tasks finished");
@@ -1101,7 +1198,7 @@ async fn exit_handler(channels: Channels) {
                 channel_guard.message_ids.push_back(message_id);
             }
         }
-        save_all_message_ids(&db_connection, channels_local);
+        save_all_message_ids(&mut db_connection, channels_local).unwrap();
         warn!("Saved message IDs, exiting due to signal.");
         std::process::exit(0);
     });
