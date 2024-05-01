@@ -4,30 +4,36 @@
 /// Its maintainer is on extended hiatus, so here's a rewrite in Rust.
 ///
 /// Some improvements over the original:
-/// * Uses slash commands in addition to regular commands
+/// * Uses slash commands instead of regular prefix commands
 ///
 /// TODO:
 /// * Maybe an admin HTTP server with some status info
+use async_recursion::async_recursion;
 use itertools::Itertools;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use poise::say_reply;
 use poise::serenity_prelude::{
-    ChannelId, GatewayIntents, Http, MessageId, Mutex, RwLock, StatusCode, Timestamp,
+    ChannelId, ChannelType, GatewayIntents, GuildChannel, Http, Message, MessageId, Mutex,
+    PartialGuildChannel, Ready, RwLock, StatusCode, Timestamp,
 };
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::sync::{mpsc, Arc, Mutex as StdMutex};
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 use time::{Duration, OffsetDateTime};
 use tokio::select;
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Notify;
-use tokio_rusqlite::Connection;
+
+mod schema;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
+
+const DB_PATH: &str = "autodelete.db";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Direction {
@@ -118,6 +124,9 @@ impl ChannelInner {
 struct ChannelOuter {
     // ID in outer so we don't have to lock the whole thing to read
     channel_id: ChannelId,
+    // Categories are actually parents to channels, but we only use this for
+    // threads.
+    parent_id: Option<ChannelId>,
     inner: Mutex<ChannelInner>,
     delete_notify: Notify,
     expire_notify: Notify,
@@ -127,9 +136,15 @@ struct ChannelOuter {
 struct Channel(Arc<ChannelOuter>);
 
 impl Channel {
-    fn new(http: Arc<Http>, channel_id: ChannelId, inner: ChannelInner) -> Self {
+    fn new(
+        http: Arc<Http>,
+        channel_id: ChannelId,
+        parent_id: Option<ChannelId>,
+        inner: ChannelInner,
+    ) -> Self {
         let channel = Channel(Arc::new(ChannelOuter {
             channel_id,
+            parent_id,
             inner: Mutex::new(inner),
             delete_notify: Notify::new(),
             expire_notify: Notify::new(),
@@ -189,8 +204,10 @@ impl Channel {
                     progress += chunk.len();
                     match chunk.len() {
                         1 => {
-                            delete_message(&http, channel_id, chunk[0], &self, &progress, &total)
-                                .await;
+                            delete_message_from_discord(
+                                &http, channel_id, chunk[0], &self, &progress, &total,
+                            )
+                            .await;
                         }
                         _ => {
                             debug!(
@@ -224,8 +241,10 @@ impl Channel {
                             continue;
                         }
                         drop(channel_guard);
-                        delete_message(&http, channel_id, message_id, &self, &progress, &total)
-                            .await;
+                        delete_message_from_discord(
+                            &http, channel_id, message_id, &self, &progress, &total,
+                        )
+                        .await;
                     }
                 }
                 let mut channel_guard = self.0.inner.lock().await;
@@ -291,7 +310,12 @@ impl Channel {
 struct Channels(Arc<RwLock<HashMap<ChannelId, Channel>>>);
 
 impl Channels {
-    async fn get_or_default(&self, http: Arc<Http>, channel_id: ChannelId) -> Channel {
+    async fn get_or_default(
+        &self,
+        http: Arc<Http>,
+        channel_id: ChannelId,
+        parent_id: Option<ChannelId>,
+    ) -> Channel {
         // Since this is only called when changing a channel's setting now,
         // we can just lock with `write()`, and not worry about race conditions
         // between the `get()` and `insert()`.
@@ -299,7 +323,7 @@ impl Channels {
         match channels.get(&channel_id).cloned() {
             Some(channel) => channel,
             None => {
-                let channel = Channel::new(http, channel_id, ChannelInner::default());
+                let channel = Channel::new(http, channel_id, parent_id, ChannelInner::default());
                 channels.insert(channel_id, channel.clone());
                 channel
             }
@@ -308,6 +332,10 @@ impl Channels {
 
     async fn get(&self, channel_id: ChannelId) -> Option<Channel> {
         self.0.read().await.get(&channel_id).cloned()
+    }
+
+    fn blocking_get(&self, channel_id: ChannelId) -> Option<Channel> {
+        self.0.blocking_read().get(&channel_id).cloned()
     }
 
     async fn remove(&self, channel_id: ChannelId) -> Option<Channel> {
@@ -328,16 +356,116 @@ impl Channels {
             .map(|(channel_id, channel)| (*channel_id, channel.clone()))
             .collect()
     }
+
+    fn blocking_to_cloned_vec(&self) -> Vec<(ChannelId, Channel)> {
+        self.0
+            .blocking_read()
+            .iter()
+            .map(|(channel_id, channel)| (*channel_id, channel.clone()))
+            .collect()
+    }
 }
+
+type DbUpdaterTx = mpsc::Sender<ChannelId>;
+type DbUpdaterRx = mpsc::Receiver<ChannelId>;
+type MessageLoggerTx = mpsc::Sender<(ChannelId, MessageId)>;
+type MessageLoggerRx = mpsc::Receiver<(ChannelId, MessageId)>;
 
 struct Data {
     // User data, which is stored and accessible in all command invocations
     channels: Channels,
-    db_connection: Arc<Mutex<Connection>>,
+    db_updater: DbUpdaterTx,
+    message_logger: MessageLoggerTx,
+}
+
+async fn fetch_archived_threads(
+    http: Arc<Http>,
+    channel_id: ChannelId,
+    private: bool,
+) -> Result<Vec<GuildChannel>, Error> {
+    let mut before = None;
+    let mut threads = Vec::new();
+    loop {
+        let threadsdata = if private {
+            channel_id
+                .get_archived_private_threads(&http, before, None)
+                .await?
+        } else {
+            channel_id
+                .get_archived_public_threads(&http, before, None)
+                .await?
+        };
+        debug!("Got {} archived threads", threadsdata.threads.len());
+        before = threadsdata.threads.last().map(|t| {
+            t.thread_metadata
+                .unwrap()
+                .archive_timestamp
+                .unwrap()
+                .unix_timestamp() as u64
+        });
+        threads.extend(threadsdata.threads);
+        if !threadsdata.has_more {
+            break;
+        }
+    }
+    Ok(threads)
+}
+
+#[async_recursion]
+async fn fetch_threads(
+    data: &Data,
+    http: Arc<Http>,
+    channel_id: ChannelId,
+    max_age: Option<Duration>,
+    max_messages: Option<u64>,
+) -> Result<(), Error> {
+    let guild_id = channel_id
+        .to_channel(&http)
+        .await?
+        .guild()
+        .unwrap()
+        .guild_id;
+
+    let threadsdata = guild_id.get_active_threads(&http).await?;
+    if threadsdata.has_more {
+        warn!("More threads than Discord returned, some might be missing. This shouldn't happen, please inform the developer at https://github.com/docwilco/rusty-trash-can/issues");
+    }
+    let active_threads = threadsdata.threads;
+    let archived_private_threads = fetch_archived_threads(http.clone(), channel_id, true).await?;
+    let archived_public_threads = fetch_archived_threads(http.clone(), channel_id, false).await?;
+
+    debug!(
+        "Got {} active, {} private archived, {} public archived threads",
+        active_threads.len(),
+        archived_private_threads.len(),
+        archived_public_threads.len()
+    );
+    let threads = active_threads
+        .into_iter()
+        .chain(archived_private_threads)
+        .chain(archived_public_threads);
+    for thread in threads {
+        debug!("Checking thread {}", thread.id);
+        if thread.parent_id == Some(channel_id) {
+            debug!("Thread {} is a child of {}", thread.id, channel_id);
+            add_or_update_channel(
+                http.clone(),
+                data,
+                channel_id,
+                thread.parent_id,
+                max_age,
+                max_messages,
+                None,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn fetch_message_history(
-    db_connection: Arc<Mutex<Connection>>,
+    db_updater: DbUpdaterTx,
+    message_logger: MessageLoggerTx,
     http: impl AsRef<Http>,
     channel: Channel,
     direction: Direction,
@@ -397,7 +525,9 @@ async fn fetch_message_history(
         );
 
         // Log to database
-        log_message_ids(db_connection.clone(), channel_id, &message_ids).await.expect("Error logging to database");
+        for message_id in &message_ids {
+            message_logger.send((channel_id, *message_id)).unwrap();
+        }
         // Add to the channel's data
         // The messages are currently going from newest to oldest, but we want
         // them in the opposite order, because that's how the channel data has
@@ -440,7 +570,7 @@ async fn fetch_message_history(
         // while we're fetching.
         channel.0.expire_notify.notify_one();
     }
-    save_message_ids(db_connection, channel).await;
+    db_updater.send(channel_id).unwrap();
     Ok(())
 }
 
@@ -500,6 +630,18 @@ async fn start(
     #[description = "Max age of messages"] max_age: Option<String>,
     #[description = "Max number of messages to keep"] max_messages: Option<u64>,
 ) -> Result<(), Error> {
+    let channel_id = ctx.channel_id();
+    // Should not be PrivateChannel or ChannelCategory
+    let channel = channel_id.to_channel(ctx).await?.guild().unwrap();
+    match channel.kind {
+        ChannelType::PublicThread | ChannelType::PrivateThread | ChannelType::NewsThread => {
+            return Err("Autodelete in threads is controlled through the parent channel, please use this command there".into());
+        }
+        ChannelType::Text => {}
+        _ => {
+            return Err("Autodelete is not supported in this channel type".into());
+        }
+    }
     let max_age = max_age.map(duration_str::parse_time).transpose();
     if max_age.is_err() {
         return Err("Invalid max age, use a number followed by a unit (`s` or `second`, `m` or `minute`, `h` or `hour`, `d` or `day`)".into());
@@ -508,45 +650,6 @@ async fn start(
     if max_age.is_none() && max_messages.is_none() {
         return Err("Must specify at least one of max messages or max age".into());
     }
-    let http = ctx.serenity_context().http.clone();
-    let channel = ctx
-        .data()
-        .channels
-        .get_or_default(http, ctx.channel_id())
-        .await;
-    let mut channel_guard = channel.0.inner.lock().await;
-    let was_inactive = channel_guard.max_age.is_none() && channel_guard.max_messages.is_none();
-    channel_guard.max_age = max_age;
-    channel_guard.max_messages = max_messages;
-    channel_guard.last_seen_message = Some(ctx.id().into());
-    // Keep the lock until we have our reply id, otherwise the reply
-    // might be trigger a message event before we know to ignore it.
-
-    // Write to database
-    let channel_id = ctx.channel_id();
-    let last_seen_message = channel_guard.last_seen_message;
-    let bot_start_message = channel_guard.bot_start_message;
-    ctx.data()
-        .db_connection
-        .lock()
-        .await
-        .call(move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO channel_settings
-                (channel_id, max_age, max_messages, last_seen_message, bot_start_message)
-                VALUES (?, ?, ?, ?, ?)",
-                params![
-                    channel_id.0 as i64,
-                    max_age.map(|x| x.whole_seconds()),
-                    max_messages.map(|x| x as i64),
-                    last_seen_message.map(|x| x.0 as i64),
-                    bot_start_message.map(|x| x.0 as i64),
-                ],
-            )?;
-            debug!("Updated channel settings for {} in database", channel_id);
-            Ok(())
-        })
-        .await?;
     let message = match (max_age, max_messages) {
         (Some(max_age), Some(max_messages)) => {
             format!("max age: {}, max messages: {}", max_age, max_messages)
@@ -555,31 +658,46 @@ async fn start(
         (Some(max_age), None) => format!("max age: {}", max_age),
         (None, None) => unreachable!(),
     };
-    info!("Settings updated for {}: {}", channel_id, message);
-    let message = format!("Autodelete settings updated: {}", message);
+    info!("Updating settings for {}: {}", channel_id, message);
+    let message = format!("Updating autodelete settings: {}", message);
     let reply = say_reply(ctx, message).await?;
     let reply_id = reply.message().await?.id;
-    channel_guard.bot_start_message = Some(reply_id);
-    // Drop the lock as soon as we have the reply id
+    let http = ctx.serenity_context().http.clone();
+    add_or_update_channel(
+        http,
+        ctx.data(),
+        channel_id,
+        None,
+        max_age,
+        max_messages,
+        Some(reply_id),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn add_or_update_channel(
+    http: Arc<Http>,
+    data: &Data,
+    channel_id: ChannelId,
+    parent_id: Option<ChannelId>,
+    max_age: Option<Duration>,
+    max_messages: Option<u64>,
+    bot_start_message: Option<MessageId>,
+) -> Result<(), Error> {
+    let channel = data
+        .channels
+        .get_or_default(http.clone(), channel_id, parent_id)
+        .await;
+    let mut channel_guard = channel.0.inner.lock().await;
+    let was_inactive = channel_guard.max_age.is_none() && channel_guard.max_messages.is_none();
+    channel_guard.max_age = max_age;
+    channel_guard.max_messages = max_messages;
+    channel_guard.bot_start_message = bot_start_message;
+    // Get for write to database
     drop(channel_guard);
-    // save the bot_start_message id to the database
-    // Use UPDATE because we've made sure the row exists above
-    ctx.data()
-        .db_connection
-        .lock()
-        .await
-        .call(move |conn| {
-            conn.execute(
-                "UPDATE channel_settings SET bot_start_message = ? WHERE channel_id = ?",
-                params![reply_id.0 as i64, channel_id.0 as i64],
-            )?;
-            debug!(
-                "Updated bot_start_message for {} to {} in database",
-                channel_id, reply_id
-            );
-            Ok(())
-        })
-        .await?;
+
+    data.db_updater.send(channel_id).unwrap();
 
     if was_inactive {
         info!(
@@ -587,13 +705,18 @@ async fn start(
             channel_id
         );
         fetch_message_history(
-            ctx.data().db_connection.clone(),
-            ctx.http(),
+            data.db_updater.clone(),
+            data.message_logger.clone(),
+            http.clone(),
             channel,
             Direction::Before,
-            Some(MessageId::from(ctx.id())),
+            // We might have a race on our hands in a busy channel, so just
+            // don't try to guess where we're at. We need to get a lot of
+            // history anyways, since this is a new channel for us.
+            None,
         )
         .await?;
+        fetch_threads(data, http, channel_id, max_age, max_messages).await?;
     } else {
         // Since the max_age might have changed, wake up the expire task
         // so it can recalculate the sleep time.
@@ -613,36 +736,39 @@ async fn start(
 ///
 /// Of course, this could be desirable, if the bot has lost track of things.
 async fn stop(ctx: Context<'_>) -> Result<(), Error> {
-    let channel = ctx.data().channels.remove(ctx.channel_id()).await;
-    // Remove from database
-    let channel_id = ctx.channel_id();
-    // Shouldn't need to do these, but just in case
-    ctx.data()
-        .db_connection
-        .lock()
-        .await
-        .call(move |conn| {
-            let tx = conn.transaction()?;
-            tx.execute(
-                "DELETE FROM channel_settings where channel_id = ?",
-                params![channel_id.0 as i64],
-            )?;
-            tx.execute(
-                "DELETE FROM message_ids where channel_id = ?",
-                params![channel_id.0 as i64],
-            )?;
-            tx.commit()?;
-            debug!("Deleted channel {} from database", channel_id);
-            Ok(())
-        })
-        .await?;
-    let message = match channel {
-        Some(_) => "Autodelete stopped",
-        None => "Autodelete was not active",
+    let message = if remove_channel(ctx.data(), ctx.channel_id()).await? {
+        "Autodelete stopped"
+    } else {
+        "Autodelete was not active"
     };
-    info!("{} for {}", message, channel_id);
     say_reply(ctx, message).await?;
     Ok(())
+}
+
+#[async_recursion]
+async fn remove_channel(data: &Data, channel_id: ChannelId) -> Result<bool, Error> {
+    // Remove any threads we might have
+    for thread_id in data
+        .channels
+        .0
+        .read()
+        .await
+        .iter()
+        .filter_map(|(id, channel)| {
+            if channel.0.parent_id == Some(channel_id) {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+    {
+        remove_channel(data, thread_id).await?;
+    }
+
+    let return_value = data.channels.remove(channel_id).await.is_some();
+    // Remove from database
+    data.db_updater.send(channel_id).unwrap();
+    Ok(return_value)
 }
 
 #[poise::command(slash_command, required_permissions = "MANAGE_MESSAGES")]
@@ -668,7 +794,7 @@ async fn status(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-async fn delete_message(
+async fn delete_message_from_discord(
     http: &Http,
     channel_id: ChannelId,
     message_id: MessageId,
@@ -693,100 +819,253 @@ async fn delete_message(
     }
 }
 
-// Task to save the message IDs periodically
+// Thread to save the message IDs periodically
+//
 // This works on all channels in one sweep, to minimize the number of database
 // calls. And also to have the disk writes be grouped together.
-fn save_task(channels: Channels) {
-    tokio::spawn(async move {
-        // Use a separate connection for the save task
-        debug!("Starting save task");
-        let db_connection = Connection::open("autodelete.db").await.unwrap();
-        // Get sleep time from environment, defaults to 5 minutes
-        let save_interval = std::env::var("SAVE_INTERVAL")
-            .map(|x| x.parse::<u64>().expect("SAVE_INTERVAL must be a number"))
-            .unwrap_or(300);
-        loop {
-            debug!("Saving message IDs");
-            let channels_local = channels.to_cloned_vec().await;
-            save_all_message_ids(&db_connection, channels_local).await;
-            info!("Saved message IDs");
-
-            tokio::time::sleep(std::time::Duration::from_secs(save_interval)).await;
-        }
+//
+// Also responsible for updating single channels when prompted through the
+// channel
+fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
+    thread::spawn(move || {
+        // This is just to be able to use ? in the closure
+        move || -> Result<(), Error> {
+            // Use a separate connection for the save task
+            debug!("Started save thread");
+            let mut db_connection = Connection::open(DB_PATH)?;
+            let rx = rx.lock().unwrap();
+            // Get sleep time from environment, defaults to 5 minutes
+            let interval = std::env::var("SAVE_INTERVAL")
+                .map(|x| x.parse::<u64>().expect("SAVE_INTERVAL must be a number"))
+                .unwrap_or(300);
+            let interval = StdDuration::from_secs(interval);
+            let mut next_save = Instant::now() + interval;
+            loop {
+                let mut now = Instant::now();
+                if now < next_save {
+                    // Sleep until it's time to save again or we get something
+                    // on the channel.
+                    match rx.recv_timeout(next_save - now) {
+                        Ok(channel_id) => {
+                            let channel = channels.blocking_get(channel_id);
+                            if let Some(channel) = channel {
+                                save_channel_to_db(&mut db_connection, channel)?;
+                            } else {
+                                delete_channel_from_db(&mut db_connection, channel_id)?;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break;
+                        }
+                    }
+                }
+                // We have either slept or saved something to the database, so
+                // now has definitely changed.
+                now = Instant::now();
+                if now >= next_save {
+                    next_save += interval;
+                    save_all_message_ids_to_db(&mut db_connection, channels.blocking_to_cloned_vec())?;
+                }
+            }
+            Ok(())
+        }()
+        .unwrap();
     });
 }
 
-async fn save_message_ids(db_connection: Arc<Mutex<Connection>>, channel: Channel) {
+fn save_channel_to_db(db_connection: &mut Connection, channel: Channel) -> Result<(), Error> {
     let channel_id = channel.0.channel_id;
-    debug!("Saving message IDs for {}", channel_id);
-    db_connection
-        .lock()
-        .await
-        .call(move |conn| {
-            let channel_guard = channel.0.inner.blocking_lock();
-            let tx = conn.transaction()?;
-            // Delete instead of truncate, so the transaction can be
-            // rolled back.
-            tx.execute(
-                "DELETE FROM message_ids WHERE channel_id = ?",
-                [channel_id.0 as i64],
-            )?;
-            let mut insert_id =
-                tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
-            for message_id in channel_guard.message_ids.iter() {
-                insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
-            }
-            drop(insert_id);
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .unwrap();
+    debug!("Saving settings & message IDs for {}", channel_id);
+    let channel_guard = channel.0.inner.blocking_lock();
+    let tx = db_connection.transaction()?;
+    tx.execute(
+        "DELETE FROM message_ids WHERE channel_id = ?",
+        [channel_id.0 as i64],
+    )?;
+    let mut insert_id =
+        tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
+    for message_id in channel_guard.message_ids.iter() {
+        insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
+    }
+    drop(insert_id);
+    tx.commit()?;
     debug!("Channel {} done saving", channel_id);
+    Ok(())
 }
 
-async fn save_all_message_ids(
-    db_connection: &Connection,
+fn delete_channel_from_db(
+    db_connection: &mut Connection,
+    channel_id: ChannelId,
+) -> Result<(), Error> {
+    debug!("Deleting settings & message IDs for {}", channel_id);
+    let tx = db_connection.transaction()?;
+    tx.execute(
+        "DELETE FROM message_ids WHERE channel_id = ?",
+        [channel_id.0 as i64],
+    )?;
+    tx.execute(
+        "DELETE FROM channel_settings WHERE channel_id = ?",
+        [channel_id.0 as i64],
+    )?;
+    tx.commit()?;
+    debug!("Channel {} done deleting", channel_id);
+    Ok(())
+}
+
+// This doesn't use `save_message_ids` so that the DELETE is a single statement
+// without WHERE clause, which sqlite can optimize. Also that way it's a single
+// transaction for the whole thing.
+fn save_all_message_ids_to_db(
+    db_connection: &mut Connection,
     channels_local: Vec<(ChannelId, Channel)>,
-) {
+) -> Result<(), Error> {
+    // First we build up an in memory list of all data we want to save, so that
+    // we don't have to wait on locks while writing to the database.
     let mut all_ids = Vec::new();
     let mut all_last_seens = Vec::new();
     // Using for loop because async closures aren't stable yet
     for (channel_id, channel) in &channels_local {
-        let channel_guard = channel.0.inner.lock().await;
+        let channel_guard = channel.0.inner.blocking_lock();
         for message_id in &channel_guard.message_ids {
             all_ids.push((*channel_id, *message_id));
         }
         all_last_seens.push((*channel_id, channel_guard.last_seen_message));
     }
 
-    db_connection
-        .call(move |conn| {
-            let tx = conn.transaction()?;
-            // Delete instead of truncate, so the transaction can be
-            // rolled back.
-            tx.execute("DELETE FROM message_ids", [])?;
-            let mut insert_id =
-                tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
-            let mut update_last_seen = tx.prepare(
-                "UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?",
-            )?;
-            for (channel_id, message_id) in &all_ids {
-                insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
-            }
-            for (channel_id, last_seen) in &all_last_seens {
-                update_last_seen.execute(params![
-                    last_seen.map(|id| id.0 as i64),
-                    channel_id.0 as i64,
-                ])?;
-            }
-            drop(insert_id);
-            drop(update_last_seen);
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .unwrap();
+    let tx = db_connection.transaction()?;
+    // Delete instead of truncate, so the transaction can be rolled
+    // back. Actually, sqlite just doesn't have truncate.
+    tx.execute("DELETE FROM message_ids", [])?;
+    let mut insert_id =
+        tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
+    let mut update_last_seen =
+        tx.prepare("UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?")?;
+    for (channel_id, message_id) in &all_ids {
+        insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
+    }
+    for (channel_id, last_seen) in &all_last_seens {
+        update_last_seen.execute(params![
+            last_seen.map(|id| id.0 as i64),
+            channel_id.0 as i64,
+        ])?;
+    }
+    drop(insert_id);
+    drop(update_last_seen);
+    tx.commit()?;
+    Ok(())
+}
+
+async fn ready_handler(http: Arc<Http>, data: &Data, data_about_bot: &Ready) {
+    info!("{} is connected!", data_about_bot.user.name);
+
+    // Catch up on messages that have happened since the bot was last online
+    let channels = data.channels.to_cloned_vec().await;
+    for (_, channel) in channels {
+        let channel_guard = channel.0.inner.lock().await;
+        let last_seen = channel_guard.last_seen_message;
+        drop(channel_guard);
+        let http = http.clone();
+        let db_updater = data.db_updater.clone();
+        let message_logger = data.message_logger.clone();
+        tokio::spawn(async move {
+            fetch_message_history(
+                db_updater,
+                message_logger,
+                http,
+                channel,
+                Direction::After,
+                last_seen,
+            )
+            .await
+            .unwrap();
+        });
+    }
+}
+
+async fn message_handler(data: &Data, new_message: &Message) -> Result<(), Error> {
+    debug!(
+        "Received message {} on channel {}",
+        new_message.id, new_message.channel_id
+    );
+    let channel = data.channels.get(new_message.channel_id).await;
+    let channel = match channel {
+        Some(channel) => channel,
+        None => {
+            debug!("Ignoring message in channel without settings");
+            return Ok(());
+        }
+    };
+    let mut channel_guard = channel.0.inner.lock().await;
+    if channel_guard.max_age.is_none() && channel_guard.max_messages.is_none() {
+        error!("Ignoring message in channel without both maxes (shouldn't happen?)");
+        return Ok(());
+    }
+    if let Some(bot_start_message) = channel_guard.bot_start_message {
+        if bot_start_message == new_message.id {
+            debug!("Ignoring bot start message");
+            return Ok(());
+        }
+    }
+    channel_guard.last_seen_message = Some(new_message.id);
+    let was_empty = channel_guard.message_ids.is_empty();
+    channel_guard.message_ids.push_back(new_message.id);
+    channel_guard.check_max_messages();
+    if !channel_guard.delete_queue.is_empty() {
+        channel.0.delete_notify.notify_one();
+    }
+    drop(channel_guard);
+    if was_empty {
+        // If the message queue was empty, it would be waiting for
+        // MAX duration, so notify the task to wake up.
+        channel.0.expire_notify.notify_one();
+    }
+
+    data.message_logger
+        .send((new_message.channel_id, new_message.id))?;
+    Ok(())
+}
+
+async fn thread_create_handler(
+    http: Arc<Http>,
+    data: &Data,
+    thread: &GuildChannel,
+) -> Result<(), Error> {
+    let parent_id = thread
+        .parent_id
+        .expect("Threads should always have parents");
+    debug!(
+        "Received thread create {} on channel {}",
+        thread.id, parent_id
+    );
+    let channel = data.channels.get(parent_id).await;
+    let channel = match channel {
+        Some(channel) => channel,
+        None => {
+            debug!("Ignoring thread create in channel without settings");
+            return Ok(());
+        }
+    };
+    let channel_guard = channel.0.inner.lock().await;
+    let max_age = channel_guard.max_age;
+    let max_messages = channel_guard.max_messages;
+    drop(channel_guard);
+    add_or_update_channel(
+        http,
+        data,
+        thread.id,
+        Some(parent_id),
+        max_age,
+        max_messages,
+        None,
+    )
+    .await
+}
+
+async fn thread_delete_handler(data: &Data, thread: &PartialGuildChannel) -> Result<(), Error> {
+    debug!("Received thread delete {}", thread.id);
+    remove_channel(data, thread.id).await?;
+    Ok(())
 }
 
 async fn event_event_handler(
@@ -795,121 +1074,23 @@ async fn event_event_handler(
     _framework: poise::FrameworkContext<'_, Data, Error>,
     user_data: &Data,
 ) -> Result<(), Error> {
+    trace!("Event: {:#?}", event);
     match event {
         poise::Event::Ready { data_about_bot } => {
-            info!("{} is connected!", data_about_bot.user.name);
-            let http = ctx.http.clone();
-
-            // Catch up on messages that have happened since the bot was last online
-            let channels = user_data.channels.to_cloned_vec().await;
-            for (_, channel) in channels {
-                let channel_guard = channel.0.inner.lock().await;
-                let last_seen = channel_guard.last_seen_message;
-                drop(channel_guard);
-                let http = http.clone();
-                let db_connection = user_data.db_connection.clone();
-                tokio::spawn(async move {
-                    fetch_message_history(
-                        db_connection,
-                        http,
-                        channel,
-                        Direction::After,
-                        last_seen,
-                    )
-                    .await
-                    .unwrap();
-                });
-            }
+            ready_handler(ctx.http.clone(), user_data, data_about_bot).await;
         }
         poise::Event::Message { new_message } => {
-            debug!(
-                "Received message {} on channel {}",
-                new_message.id, new_message.channel_id
-            );
-            let channel = user_data.channels.get(new_message.channel_id).await;
-            let channel = match channel {
-                Some(channel) => channel,
-                None => {
-                    debug!("Ignoring message in channel without settings");
-                    return Ok(());
-                }
-            };
-            let mut channel_guard = channel.0.inner.lock().await;
-            if channel_guard.max_age.is_none() && channel_guard.max_messages.is_none() {
-                error!("Ignoring message in channel without both maxes (shouldn't happen?)");
-                return Ok(());
-            }
-            if let Some(bot_start_message) = channel_guard.bot_start_message {
-                if bot_start_message == new_message.id {
-                    debug!("Ignoring bot start message");
-                    return Ok(());
-                }
-            }
-            channel_guard.last_seen_message = Some(new_message.id);
-            let was_empty = channel_guard.message_ids.is_empty();
-            channel_guard.message_ids.push_back(new_message.id);
-            channel_guard.check_max_messages();
-            if !channel_guard.delete_queue.is_empty() {
-                channel.0.delete_notify.notify_one();
-            }
-            drop(channel_guard);
-            if was_empty {
-                // If the message queue was empty, it would be waiting for
-                // MAX duration, so notify the task to wake up.
-                channel.0.expire_notify.notify_one();
-            }
-
-            log_message_id(user_data, new_message.channel_id, new_message.id).await?;
+            message_handler(user_data, new_message).await?;
+        }
+        poise::Event::ThreadCreate { thread } => {
+            thread_create_handler(ctx.http.clone(), user_data, thread).await?;
+        }
+        poise::Event::ThreadDelete { thread } => {
+            thread_delete_handler(user_data, thread).await?;
         }
         _ => (),
     }
 
-    Ok(())
-}
-
-async fn log_message_id(
-    data: &Data,
-    channel_id: ChannelId,
-    message_id: MessageId,
-) -> Result<(), Error> {
-    data.db_connection
-        .lock()
-        .await
-        .call(move |conn| {
-            conn.execute(
-                "INSERT OR IGNORE INTO message_log (channel_id, message_id) VALUES (?, ?)",
-                params![channel_id.0 as i64, message_id.0 as i64],
-            )?;
-            debug!("Logged message {} to database", message_id);
-            Ok(())
-        })
-        .await?;
-    Ok(())
-}
-
-async fn log_message_ids(
-    db_connection: Arc<Mutex<Connection>>,
-    channel_id: ChannelId,
-    message_ids: &[MessageId],
-) -> Result<(), Error> {
-    let message_ids = message_ids.to_vec();
-    db_connection
-        .lock()
-        .await
-        .call(move |conn| {
-            let tx = conn.transaction()?;
-            let mut statement = tx.prepare(
-                "INSERT OR IGNORE INTO message_log (channel_id, message_id) VALUES (?, ?)",
-            )?;
-            for message_id in message_ids {
-                statement.execute(params![channel_id.0 as i64, message_id.0 as i64])?;
-            }
-            drop(statement);
-            tx.commit()?;
-            debug!("Saved messages to log");
-            Ok(())
-        })
-        .await?;
     Ok(())
 }
 
@@ -952,13 +1133,44 @@ async fn wait_for_termination() {
     }
 }
 
-async fn exit_handler(channels: Channels, db_connection: Connection) {
+fn message_logger_thread(rx: StdMutex<MessageLoggerRx>) {
+    thread::spawn(move || -> Result<(), Error> {
+        let rx = rx.lock().unwrap();
+        let mut db_connection = Connection::open(DB_PATH)?;
+        let mut ids = Vec::new();
+        loop {
+            ids.clear();
+            let tuple = rx
+                .recv()
+                .expect("Message logger channel should never close");
+            ids.push(tuple);
+            // See if there's more messages waiting
+            while let Ok(tuple) = rx.try_recv() {
+                ids.push(tuple);
+            }
+            let tx = db_connection.transaction()?;
+            for (channel_id, message_id) in ids.iter() {
+                tx.execute(
+                    "INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)",
+                    params![channel_id.0 as i64, message_id.0 as i64],
+                )?;
+            }
+            tx.commit()?;
+        }
+    });
+}
+
+async fn exit_handler(channels: Channels) {
     tokio::spawn(async move {
+        // This is not async, but we're at startup, so a hiccup is acceptable
+        let mut db_connection = Connection::open(DB_PATH).unwrap();
         wait_for_termination().await;
         info!("Signal received, shutting down.");
-        // We hang on to the write lock until the end of the function, so
-        // that nothing can be added, nor that the periodic save task can
-        // run before we exit.
+        // We hang on to the write lock until the end of the function, so that
+        // nothing can be added, nor that the periodic save task can run before
+        // we exit.
+        // Also, we keep doing everything async until it's time to write to the
+        // database, so that we avoid deadlocks.
         let channels_guard = channels.0.write().await;
         let channels_local = channels_guard
             .iter()
@@ -982,7 +1194,7 @@ async fn exit_handler(channels: Channels, db_connection: Connection) {
                 }
                 drop(channel_guard);
                 debug!("Waiting for tasks to finish (100ms sleep)");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(StdDuration::from_millis(100)).await;
             }
         }
         debug!("Tasks finished");
@@ -999,109 +1211,90 @@ async fn exit_handler(channels: Channels, db_connection: Connection) {
                 channel_guard.message_ids.push_back(message_id);
             }
         }
-        save_all_message_ids(&db_connection, channels_local).await;
+        save_all_message_ids_to_db(&mut db_connection, channels_local).unwrap();
         warn!("Saved message IDs, exiting due to signal.");
         std::process::exit(0);
     });
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Error> {
     dotenv::dotenv().ok();
     env_logger::init();
     info!("Starting up");
 
-    let db_connection = Connection::open("autodelete.db").await.unwrap();
+    let mut conn = Connection::open(DB_PATH)?;
+    schema::check_and_upgrade_schema(&mut conn)?;
 
-    let channels = db_connection
-        .call(|conn| {
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS channel_settings (
-                    channel_id INTEGER PRIMARY KEY,
-                    max_age INTEGER,
-                    max_messages INTEGER,
-                    last_seen_message INTEGER,
-                    bot_start_message INTEGER
-                )",
-                [],
-            )?;
-            let mut channel_settings =
-                conn.prepare("SELECT channel_id, max_age, max_messages, last_seen_message, bot_start_message FROM channel_settings")?;
-            let channel_settings: HashMap<ChannelId, ChannelInner> = channel_settings
-                .query_map([], |row| {
-                    let channel_id: i64 = row.get(0)?;
-                    let max_age: Option<i64> = row.get(1)?;
-                    let max_messages: Option<i64> = row.get(2)?;
-                    let last_seen_message: Option<i64> = row.get(3)?;
-                    let bot_start_message: Option<i64> = row.get(4)?;
-                    Ok((
-                        ChannelId(channel_id as u64),
-                        ChannelInner {
-                            max_age: max_age.map(Duration::seconds),
-                            max_messages: max_messages.map(|x| x as u64),
-                            last_seen_message: last_seen_message.map(|id| MessageId::from(id as u64)),
-                            bot_start_message: bot_start_message.map(|id| MessageId::from(id as u64)),
-                            ..Default::default()
-                        },
-                    ))
-                })?
-                .collect::<Result<HashMap<ChannelId, ChannelInner>, rusqlite::Error>>()?;
-            Ok(channel_settings)
-        })
-        .await
-        .unwrap();
+    let mut channels_query = conn.prepare(
+        "SELECT channel_id,
+            parent_id,
+            max_age,
+            max_messages,
+            last_seen_message,
+            bot_start_message
+        FROM channel_settings",
+    )?;
+    let channels: Vec<(ChannelId, Option<ChannelId>, ChannelInner)> = channels_query
+        .query_map([], |row| {
+            let channel_id: i64 = row.get(0)?;
+            let parent_id: Option<i64> = row.get(1)?;
+            let max_age: Option<i64> = row.get(2)?;
+            let max_messages: Option<i64> = row.get(3)?;
+            let last_seen_message: Option<i64> = row.get(4)?;
+            let bot_start_message: Option<i64> = row.get(5)?;
+            Ok((
+                ChannelId(channel_id as u64),
+                parent_id.map(|id| ChannelId(id as u64)),
+                ChannelInner {
+                    max_age: max_age.map(Duration::seconds),
+                    max_messages: max_messages.map(|x| x as u64),
+                    last_seen_message: last_seen_message.map(|id| MessageId::from(id as u64)),
+                    bot_start_message: bot_start_message.map(|id| MessageId::from(id as u64)),
+                    ..Default::default()
+                },
+            ))
+        })?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
     info!("Loaded channel settings from database");
     debug!("Channel settings:");
-    channels.iter().for_each(|(k, v)| {
-        debug!("{}: {:?}", k, v);
-    });
+    channels
+        .iter()
+        .for_each(|(id, parent_id, inner)| match parent_id {
+            Some(parent) => debug!("{} (parent: {}): {:?}", id, parent, inner),
+            None => debug!("{}: {:?}", id, inner),
+        });
 
-    let mut message_ids = db_connection
-        .call(|conn| {
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS message_ids (
-                    channel_id INTEGER,
-                    message_id INTEGER,
-                    PRIMARY KEY (channel_id, message_id)
-                )",
-                [],
-            )?;
-            let mut message_ids_query = conn.prepare(
-                "SELECT channel_id, message_id
-                        FROM message_ids
-                        ORDER BY channel_id, message_id",
-            )?;
-            let mut message_ids: HashMap<ChannelId, VecDeque<MessageId>> = HashMap::new();
-            for row in message_ids_query.query_map([], |row| {
-                let channel_id: i64 = row.get(0)?;
-                let message_id: i64 = row.get(1)?;
-                Ok((ChannelId(channel_id as u64), MessageId(message_id as u64)))
-            })? {
-                let (channel_id, message_id) = row?;
-                let message_ids = message_ids.entry(channel_id).or_default();
-                message_ids.push_back(message_id);
-            }
-            info!("Loaded message IDs from database");
-            debug!("Loaded message IDs: {:?}", message_ids);
-            Ok(message_ids)
-        })
-        .await
-        .unwrap();
+    let mut message_ids_query = conn.prepare(
+        "SELECT channel_id, message_id
+            FROM message_ids
+            ORDER BY channel_id, message_id",
+    )?;
+    let mut message_ids: HashMap<ChannelId, VecDeque<MessageId>> = HashMap::new();
+    for row in message_ids_query.query_map([], |row| {
+        let channel_id: i64 = row.get(0)?;
+        let message_id: i64 = row.get(1)?;
+        Ok((ChannelId(channel_id as u64), MessageId(message_id as u64)))
+    })? {
+        let (channel_id, message_id) = row?;
+        message_ids
+            .entry(channel_id)
+            .or_default()
+            .push_back(message_id);
+    }
+    info!("Loaded message IDs from database");
+    debug!("Loaded message IDs: {:?}", message_ids);
 
-    db_connection
-        .call(|conn| {
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS message_log (
-                channel_id INTEGER,
-                message_id INTEGER,
-                PRIMARY KEY (channel_id, message_id)
-            )",
-                [],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
+    drop(message_ids_query);
+    drop(channels_query);
+    drop(conn);
+
+    let (message_logger_tx, message_logger_rx) = mpsc::channel();
+    let (db_updater_tx, db_updater_rx) = mpsc::channel();
+    // Just so we can send them to the threads that needs to receive stuff
+    let db_updater_rx = StdMutex::new(db_updater_rx);
+    let message_logger_rx = StdMutex::new(message_logger_rx);
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -1112,7 +1305,11 @@ async fn main() {
             ..Default::default()
         })
         .token(std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN"))
-        .intents(GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS)
+        .intents(
+            GatewayIntents::GUILD_MESSAGES
+                | GatewayIntents::GUILDS
+                | GatewayIntents::MESSAGE_CONTENT,
+        )
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
@@ -1120,25 +1317,31 @@ async fn main() {
                 // Converting from ChannelInner to Channel requires the Http client, so we do it here
                 let channels = channels
                     .into_iter()
-                    .map(|(channel_id, mut inner)| {
+                    .map(|(channel_id, parent_id, mut inner)| {
+                        // `remove` so we can just move it out of the HashMap
                         inner.message_ids = message_ids.remove(&channel_id).unwrap_or_default();
                         (
                             channel_id,
-                            Channel::new(ctx.http.clone(), channel_id, inner),
+                            Channel::new(ctx.http.clone(), channel_id, parent_id, inner),
                         )
                     })
                     .collect::<HashMap<ChannelId, Channel>>();
                 let channels = Channels(Arc::new(RwLock::new(channels)));
-                // background task for periodic saving
-                save_task(channels.clone());
-                exit_handler(channels.clone(), db_connection.clone()).await;
+                // background thread for writing to database
+                db_updater_thread(db_updater_rx, channels.clone());
+                // background thread for logging message IDs
+                message_logger_thread(message_logger_rx);
+                // background task to handle exiting
+                exit_handler(channels.clone()).await;
                 let data = Data {
-                    db_connection: Arc::new(Mutex::new(db_connection)),
                     channels,
+                    db_updater: db_updater_tx,
+                    message_logger: message_logger_tx,
                 };
                 Ok(data)
             })
         });
     info!("Initialization complete. Starting framework!");
-    framework.run().await.unwrap();
+    framework.run().await?;
+    Ok(())
 }
