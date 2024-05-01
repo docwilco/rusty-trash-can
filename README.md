@@ -42,5 +42,5 @@ Show help, optionally for a specific command.
 2. Make it a bot, copy the token
 3. Copy `.env.example` to `.env` and fill in the token you got above
 4. `cargo run`
-5. Invite using `https://discord.com/oauth2/authorize?client_id=<app_id>&permissions=76800&scope=bot` (replacing `<app_id>` with your Discord App Id)
+5. Invite using `https://discord.com/oauth2/authorize?client_id=<app_id>&permissions=17179945984&scope=bot` (replacing `<app_id>` with your Discord App Id)
 
