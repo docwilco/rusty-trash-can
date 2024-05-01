@@ -10,7 +10,7 @@
 /// * Maybe an admin HTTP server with some status info
 use async_recursion::async_recursion;
 use itertools::Itertools;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use poise::say_reply;
 use poise::serenity_prelude::{
     ChannelId, ChannelType, GatewayIntents, GuildChannel, Http, Message, MessageId, Mutex,
@@ -395,6 +395,7 @@ async fn fetch_archived_threads(
                 .get_archived_public_threads(&http, before, None)
                 .await?
         };
+        debug!("Got {} archived threads", threadsdata.threads.len());
         before = threadsdata.threads.last().map(|t| {
             t.thread_metadata
                 .unwrap()
@@ -433,6 +434,12 @@ async fn fetch_threads(
     let archived_private_threads = fetch_archived_threads(http.clone(), channel_id, true).await?;
     let archived_public_threads = fetch_archived_threads(http.clone(), channel_id, false).await?;
 
+    debug!(
+        "Got {} active, {} private archived, {} public archived threads",
+        active_threads.len(),
+        archived_private_threads.len(),
+        archived_public_threads.len()
+    );
     let threads = active_threads
         .into_iter()
         .chain(archived_private_threads)
@@ -1067,7 +1074,7 @@ async fn event_event_handler(
     _framework: poise::FrameworkContext<'_, Data, Error>,
     user_data: &Data,
 ) -> Result<(), Error> {
-    println!("Event: {:#?}", event);
+    trace!("Event: {:#?}", event);
     match event {
         poise::Event::Ready { data_about_bot } => {
             ready_handler(ctx.http.clone(), user_data, data_about_bot).await;

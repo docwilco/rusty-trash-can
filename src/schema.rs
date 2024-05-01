@@ -1,7 +1,11 @@
 use crate::Error;
+use log::info;
 use rusqlite::Connection;
 
-const VERSION_SCRIPTS: [&str; 2] = [include_str!("schema_v1.sql"), include_str!("schema_v2.sql")];
+const VERSION_SCRIPTS: [(&str, &str); 2] = [
+    ("schema v1", include_str!("schema_v1.sql")),
+    ("schema v2", include_str!("schema_v2.sql")),
+];
 
 pub fn check_and_upgrade_schema(conn: &mut Connection) -> Result<(), Error> {
     // Get user_version pragma
@@ -12,7 +16,8 @@ pub fn check_and_upgrade_schema(conn: &mut Connection) -> Result<(), Error> {
     }
     let tx = conn.transaction()?;
     // Execute scripts, skip those already executed according to pragma
-    for script in &VERSION_SCRIPTS[user_version..] {
+    for (name, script) in &VERSION_SCRIPTS[user_version..] {
+        info!("Executing {}", name);
         tx.execute_batch(script)?;
     }
     // Update pragma
@@ -21,5 +26,6 @@ pub fn check_and_upgrade_schema(conn: &mut Connection) -> Result<(), Error> {
         [],
     )?;
     tx.commit()?;
+    info!("Schema updated to version {}", VERSION_SCRIPTS.len());
     Ok(())
 }
