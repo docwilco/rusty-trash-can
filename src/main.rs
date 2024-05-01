@@ -451,7 +451,7 @@ async fn fetch_threads(
             add_or_update_channel(
                 http.clone(),
                 data,
-                channel_id,
+                thread.id,
                 thread.parent_id,
                 max_age,
                 max_messages,
@@ -685,6 +685,7 @@ async fn add_or_update_channel(
     max_messages: Option<u64>,
     bot_start_message: Option<MessageId>,
 ) -> Result<(), Error> {
+    debug!("Adding or updating channel {}", channel_id);
     let channel = data
         .channels
         .get_or_default(http.clone(), channel_id, parent_id)
