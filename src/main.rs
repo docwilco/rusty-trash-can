@@ -8,21 +8,24 @@
 ///
 /// TODO:
 /// * Maybe an admin HTTP server with some status info
+use anyhow::{anyhow, Context as AnyhowContext};
 use async_recursion::async_recursion;
+use chrono::{TimeDelta, Utc};
 use itertools::Itertools;
 use log::{debug, error, info, trace, warn};
-use poise::say_reply;
 use poise::serenity_prelude::{
-    ChannelId, ChannelType, GatewayIntents, GuildChannel, Http, Message, MessageId, Mutex,
-    PartialGuildChannel, Ready, RwLock, StatusCode, Timestamp,
+    prelude::{Mutex, RwLock},
+    CacheHttp, ChannelId, ChannelType, ClientBuilder, FullEvent, GatewayIntents, GetMessages, GuildChannel, Http,
+    Message, MessageId, PartialGuildChannel, Ready, StatusCode, Timestamp,
 };
+use poise::{say_reply, FrameworkContext};
+use pretty_duration::pretty_duration;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::sync::{mpsc, Arc, Mutex as StdMutex};
-use std::thread;
-use std::time::{Duration as StdDuration, Instant};
-use time::{Duration, OffsetDateTime};
+use std::time::{Duration, Instant};
+use std::{env, thread};
 use tokio::select;
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
@@ -52,7 +55,7 @@ impl Display for Direction {
 
 #[derive(Debug, Default)]
 struct ChannelInner {
-    max_age: Option<Duration>,
+    max_age: Option<TimeDelta>,
     max_messages: Option<u64>,
     message_ids: VecDeque<MessageId>,
     delete_queue: Vec<MessageId>,
@@ -73,11 +76,11 @@ impl ChannelInner {
         }
     }
 
-    fn check_expiry(&mut self) -> (usize, Option<StdDuration>) {
+    fn check_expiry(&mut self) -> (usize, Option<TimeDelta>) {
         let mut expired = 0;
         let mut duration_to_next = None;
         if let Some(max_age) = self.max_age {
-            let now = OffsetDateTime::now_utc();
+            let now = Utc::now();
             let oldest_allowed = Timestamp::from(now - max_age);
             while let Some(first) = self.message_ids.front() {
                 if first.created_at() < oldest_allowed {
@@ -91,11 +94,11 @@ impl ChannelInner {
                         .push(self.message_ids.pop_front().unwrap());
                     expired += 1;
                 } else {
-                    // Deref gives the OffsetDateTime, which implements Add & Sub
+                    // Deref gives the TimeDelta, which implements Add & Sub
                     let to_next = *first.created_at() + max_age - now;
                     // It has to be in the future, because it's not expired yet
-                    assert!(to_next > Duration::ZERO);
-                    duration_to_next = Some(to_next.unsigned_abs());
+                    assert!(to_next > TimeDelta::zero());
+                    duration_to_next = Some(to_next);
                     // messages should be sorted by timestamp, so we can stop here.
                     break;
                 }
@@ -185,7 +188,7 @@ impl Channel {
                 let two_weeks_ago = Timestamp::from(
                     // Take one hour off to avoid race conditions with clocks that are
                     // a little (up to an hour) out of sync.
-                    OffsetDateTime::now_utc() - Duration::weeks(2) + Duration::hours(1),
+                    Utc::now() - TimeDelta::weeks(2) + TimeDelta::hours(1),
                 );
                 let total = delete_queue_local.len();
                 let mut progress: usize = 0;
@@ -277,16 +280,16 @@ impl Channel {
                 // Sleep at least 1 second, so that deletes can possibly be grouped
                 let sleep_time = sleep_time
                     .map(|x| {
-                        if x < StdDuration::from_secs(1) {
-                            StdDuration::from_secs(1)
+                        if x < TimeDelta::seconds(1) {
+                            TimeDelta::seconds(1)
                         } else {
                             x
                         }
                     })
-                    .unwrap_or(StdDuration::MAX);
+                    .unwrap_or(TimeDelta::max_value());
                 debug!(
                     "Expire task sleeping for {} for channel {}",
-                    if sleep_time == StdDuration::MAX {
+                    if sleep_time == TimeDelta::max_value() {
                         "forever".to_string()
                     } else {
                         format!("{:?} seconds", sleep_time)
@@ -294,7 +297,7 @@ impl Channel {
                     channel_id
                 );
                 select! {
-                    _ = tokio::time::sleep(sleep_time) => {
+                    _ = tokio::time::sleep(sleep_time.to_std().unwrap()) => {
                         debug!("Expire task for channel {} woke up", channel_id);
                     }
                     _ = self.0.expire_notify.notified() => {
@@ -416,7 +419,7 @@ async fn fetch_threads(
     data: &Data,
     http: Arc<Http>,
     channel_id: ChannelId,
-    max_age: Option<Duration>,
+    max_age: Option<TimeDelta>,
     max_messages: Option<u64>,
 ) -> Result<(), Error> {
     let guild_id = channel_id
@@ -466,7 +469,7 @@ async fn fetch_threads(
 async fn fetch_message_history(
     db_updater: DbUpdaterTx,
     message_logger: MessageLoggerTx,
-    http: impl AsRef<Http>,
+    http: &impl CacheHttp,
     channel: Channel,
     direction: Direction,
     message_id: Option<MessageId>,
@@ -491,15 +494,19 @@ async fn fetch_message_history(
         // These requests are automatically rate limited by serenity, so it
         // can take a while to fetch a lot of messages. Put them in our channel
         // metadata as we get each chunk.
-        let messages = channel_id
-            .messages(&http, |b| match (origin, direction) {
-                (Some(origin), Direction::After) => b.after(origin).limit(100),
-                (Some(origin), Direction::Before) => b.before(origin).limit(100),
-                (None, _) => b.limit(100),
-            })
-            .await?;
+        let builder = GetMessages::new();
+        let builder = match (origin, direction) {
+            (Some(origin), Direction::Before) => builder.before(origin),
+            (Some(origin), Direction::After) => builder.after(origin),
+            (None, _) => builder,
+        }
+        .limit(100);
+        let messages = channel_id.messages(http, builder).await?;
         if messages.is_empty() {
             break;
+        }
+        for message in &messages {
+            debug!("Fetched message {}, kind: {:?}", message.id, message.kind);
         }
         if direction == Direction::After {
             origin = Some(messages.first().unwrap().id);
@@ -642,7 +649,7 @@ async fn start(
             return Err("Autodelete is not supported in this channel type".into());
         }
     }
-    let max_age = max_age.map(duration_str::parse_time).transpose();
+    let max_age = max_age.map(duration_str::parse_chrono).transpose();
     if max_age.is_err() {
         return Err("Invalid max age, use a number followed by a unit (`s` or `second`, `m` or `minute`, `h` or `hour`, `d` or `day`)".into());
     }
@@ -655,7 +662,7 @@ async fn start(
             format!("max age: {}, max messages: {}", max_age, max_messages)
         }
         (None, Some(max_messages)) => format!("max messages: {}", max_messages),
-        (Some(max_age), None) => format!("max age: {}", max_age),
+        (Some(max_age), None) => format!("max age: {}", pretty_duration(&max_age.to_std()?, None)),
         (None, None) => unreachable!(),
     };
     info!("Updating settings for {}: {}", channel_id, message);
@@ -681,7 +688,7 @@ async fn add_or_update_channel(
     data: &Data,
     channel_id: ChannelId,
     parent_id: Option<ChannelId>,
-    max_age: Option<Duration>,
+    max_age: Option<TimeDelta>,
     max_messages: Option<u64>,
     bot_start_message: Option<MessageId>,
 ) -> Result<(), Error> {
@@ -708,7 +715,7 @@ async fn add_or_update_channel(
         fetch_message_history(
             data.db_updater.clone(),
             data.message_logger.clone(),
-            http.clone(),
+            &http.clone(),
             channel,
             Direction::Before,
             // We might have a race on our hands in a busy channel, so just
@@ -810,8 +817,12 @@ async fn delete_message_from_discord(
             // Message was already deleted
             warn!("404: Message {} was already deleted", message_id);
         }
+        Err(serenity::Error::Http(e)) if e.status_code() == Some(StatusCode::FORBIDDEN) => {
+            // We don't have permission to delete the message
+            warn!("403: No permission to delete message {}", message_id);
+        }
         Err(e) => {
-            error!("Error deleting message: {}", e);
+            error!("Error deleting message: {:?}", e);
             debug!("Returning message to queue");
             channel.0.inner.lock().await.delete_queue.push(message_id);
             channel.0.delete_notify.notify_one();
@@ -839,7 +850,7 @@ fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
             let interval = std::env::var("SAVE_INTERVAL")
                 .map(|x| x.parse::<u64>().expect("SAVE_INTERVAL must be a number"))
                 .unwrap_or(300);
-            let interval = StdDuration::from_secs(interval);
+            let interval = Duration::from_secs(interval);
             let mut next_save = Instant::now() + interval;
             loop {
                 let mut now = Instant::now();
@@ -866,7 +877,10 @@ fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
                 now = Instant::now();
                 if now >= next_save {
                     next_save += interval;
-                    save_all_message_ids_to_db(&mut db_connection, channels.blocking_to_cloned_vec())?;
+                    save_all_message_ids_to_db(
+                        &mut db_connection,
+                        channels.blocking_to_cloned_vec(),
+                    )?;
                 }
             }
             Ok(())
@@ -882,12 +896,12 @@ fn save_channel_to_db(db_connection: &mut Connection, channel: Channel) -> Resul
     let tx = db_connection.transaction()?;
     tx.execute(
         "DELETE FROM message_ids WHERE channel_id = ?",
-        [channel_id.0 as i64],
+        [channel_id.get() as i64],
     )?;
     let mut insert_id =
         tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
     for message_id in channel_guard.message_ids.iter() {
-        insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
+        insert_id.execute([channel_id.get() as i64, message_id.get() as i64])?;
     }
     drop(insert_id);
     tx.commit()?;
@@ -903,11 +917,11 @@ fn delete_channel_from_db(
     let tx = db_connection.transaction()?;
     tx.execute(
         "DELETE FROM message_ids WHERE channel_id = ?",
-        [channel_id.0 as i64],
+        [channel_id.get() as i64],
     )?;
     tx.execute(
         "DELETE FROM channel_settings WHERE channel_id = ?",
-        [channel_id.0 as i64],
+        [channel_id.get() as i64],
     )?;
     tx.commit()?;
     debug!("Channel {} done deleting", channel_id);
@@ -943,12 +957,12 @@ fn save_all_message_ids_to_db(
     let mut update_last_seen =
         tx.prepare("UPDATE channel_settings SET last_seen_message = ? WHERE channel_id = ?")?;
     for (channel_id, message_id) in &all_ids {
-        insert_id.execute([channel_id.0 as i64, message_id.0 as i64])?;
+        insert_id.execute([channel_id.get() as i64, message_id.get() as i64])?;
     }
     for (channel_id, last_seen) in &all_last_seens {
         update_last_seen.execute(params![
-            last_seen.map(|id| id.0 as i64),
-            channel_id.0 as i64,
+            last_seen.map(|id| id.get() as i64),
+            channel_id.get() as i64,
         ])?;
     }
     drop(insert_id);
@@ -973,7 +987,7 @@ async fn ready_handler(http: Arc<Http>, data: &Data, data_about_bot: &Ready) {
             fetch_message_history(
                 db_updater,
                 message_logger,
-                http,
+                &http,
                 channel,
                 Direction::After,
                 last_seen,
@@ -1070,24 +1084,28 @@ async fn thread_delete_handler(data: &Data, thread: &PartialGuildChannel) -> Res
 }
 
 async fn event_event_handler(
-    ctx: &serenity::prelude::Context,
-    event: &poise::Event<'_>,
-    _framework: poise::FrameworkContext<'_, Data, Error>,
-    user_data: &Data,
+    framework: FrameworkContext<'_, Data, Error>,
+    event: &FullEvent,
 ) -> Result<(), Error> {
+    let data = framework.user_data;
+    let ctx = framework.serenity_context;
+
     trace!("Event: {:#?}", event);
     match event {
-        poise::Event::Ready { data_about_bot } => {
-            ready_handler(ctx.http.clone(), user_data, data_about_bot).await;
+        FullEvent::Ready { data_about_bot } => {
+            ready_handler(ctx.http.clone(), data, data_about_bot).await;
         }
-        poise::Event::Message { new_message } => {
-            message_handler(user_data, new_message).await?;
+        FullEvent::Message { new_message } => {
+            message_handler(data, new_message).await?;
         }
-        poise::Event::ThreadCreate { thread } => {
-            thread_create_handler(ctx.http.clone(), user_data, thread).await?;
+        FullEvent::ThreadCreate { thread } => {
+            thread_create_handler(ctx.http.clone(), data, thread).await?;
         }
-        poise::Event::ThreadDelete { thread } => {
-            thread_delete_handler(user_data, thread).await?;
+        FullEvent::ThreadDelete {
+            thread,
+            full_thread_data: _,
+        } => {
+            thread_delete_handler(data, thread).await?;
         }
         _ => (),
     }
@@ -1153,7 +1171,7 @@ fn message_logger_thread(rx: StdMutex<MessageLoggerRx>) {
             for (channel_id, message_id) in ids.iter() {
                 tx.execute(
                     "INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)",
-                    params![channel_id.0 as i64, message_id.0 as i64],
+                    params![channel_id.get() as i64, message_id.get() as i64],
                 )?;
             }
             tx.commit()?;
@@ -1195,7 +1213,7 @@ async fn exit_handler(channels: Channels) {
                 }
                 drop(channel_guard);
                 debug!("Waiting for tasks to finish (100ms sleep)");
-                tokio::time::sleep(StdDuration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
         debug!("Tasks finished");
@@ -1245,10 +1263,10 @@ async fn main() -> Result<(), Error> {
             let last_seen_message: Option<i64> = row.get(4)?;
             let bot_start_message: Option<i64> = row.get(5)?;
             Ok((
-                ChannelId(channel_id as u64),
-                parent_id.map(|id| ChannelId(id as u64)),
+                ChannelId::new(channel_id as u64),
+                parent_id.map(|id| ChannelId::new(id as u64)),
                 ChannelInner {
-                    max_age: max_age.map(Duration::seconds),
+                    max_age: max_age.map(TimeDelta::seconds),
                     max_messages: max_messages.map(|x| x as u64),
                     last_seen_message: last_seen_message.map(|id| MessageId::from(id as u64)),
                     bot_start_message: bot_start_message.map(|id| MessageId::from(id as u64)),
@@ -1276,7 +1294,10 @@ async fn main() -> Result<(), Error> {
     for row in message_ids_query.query_map([], |row| {
         let channel_id: i64 = row.get(0)?;
         let message_id: i64 = row.get(1)?;
-        Ok((ChannelId(channel_id as u64), MessageId(message_id as u64)))
+        Ok((
+            ChannelId::new(channel_id as u64),
+            MessageId::new(message_id as u64),
+        ))
     })? {
         let (channel_id, message_id) = row?;
         message_ids
@@ -1297,20 +1318,15 @@ async fn main() -> Result<(), Error> {
     let db_updater_rx = StdMutex::new(db_updater_rx);
     let message_logger_rx = StdMutex::new(message_logger_rx);
 
+    let token = env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
+    let intents =
+        GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS | GatewayIntents::MESSAGE_CONTENT;
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![autodelete()],
-            event_handler: |ctx, event, framework, user_data| {
-                Box::pin(event_event_handler(ctx, event, framework, user_data))
-            },
+            event_handler: |framework, event| Box::pin(event_event_handler(framework, event)),
             ..Default::default()
         })
-        .token(std::env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN"))
-        .intents(
-            GatewayIntents::GUILD_MESSAGES
-                | GatewayIntents::GUILDS
-                | GatewayIntents::MESSAGE_CONTENT,
-        )
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
@@ -1341,8 +1357,12 @@ async fn main() -> Result<(), Error> {
                 };
                 Ok(data)
             })
-        });
+        })
+        .build();
+    let mut client = ClientBuilder::new(token, intents)
+        .framework(framework)
+        .await.context(anyhow!("Client build failed"))?;
     info!("Initialization complete. Starting framework!");
-    framework.run().await?;
+    client.start().await.context("Client start failed")?;
     Ok(())
 }
