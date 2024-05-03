@@ -64,6 +64,7 @@ struct ChannelInner {
     stop_tasks: bool,
     delete_task_stopped: bool,
     expire_task_stopped: bool,
+    fetched_history: bool,
 }
 
 impl ChannelInner {
@@ -175,7 +176,9 @@ impl Channel {
                     channel_guard.delete_task_stopped = true;
                     break;
                 }
-                let delete_thread = self.0.parent_id.is_some() && channel_guard.message_ids.is_empty();
+                let delete_thread = self.0.parent_id.is_some()
+                    && channel_guard.fetched_history
+                    && channel_guard.message_ids.is_empty();
                 delete_queue_local.append(&mut channel_guard.delete_queue);
                 drop(channel_guard);
                 // If the thread is empty, just delete the thread.
@@ -265,7 +268,7 @@ impl Channel {
                 if channel_guard.check_stopped(channel_id) {
                     channel_guard.delete_task_stopped = true;
                     break;
-                }                           
+                }
             }
         });
     }
@@ -1171,8 +1174,11 @@ async fn wait_for_termination() {
 
 fn message_logger_thread(rx: StdMutex<MessageLoggerRx>) {
     thread::spawn(move || -> Result<(), Error> {
+        debug!("Started message logger thread");
         let rx = rx.lock().unwrap();
+        debug!("Unlocked receiver mutex");
         let mut db_connection = Connection::open(DB_PATH)?;
+        debug!("Opened database connection");
         let mut ids = Vec::new();
         loop {
             ids.clear();
@@ -1184,6 +1190,7 @@ fn message_logger_thread(rx: StdMutex<MessageLoggerRx>) {
             while let Ok(tuple) = rx.try_recv() {
                 ids.push(tuple);
             }
+            debug!("Got {} messages to log", ids.len());
             let tx = db_connection.transaction()?;
             for (channel_id, message_id) in ids.iter() {
                 tx.execute(
@@ -1192,6 +1199,7 @@ fn message_logger_thread(rx: StdMutex<MessageLoggerRx>) {
                 )?;
             }
             tx.commit()?;
+            debug!("Logged messages to database");
         }
     });
 }
@@ -1341,7 +1349,7 @@ async fn main() -> Result<(), Error> {
 
     let token = env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
     let intents =
-        GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS | GatewayIntents::MESSAGE_CONTENT;
+        GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS;
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![autodelete()],
