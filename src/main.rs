@@ -175,8 +175,19 @@ impl Channel {
                     channel_guard.delete_task_stopped = true;
                     break;
                 }
+                let delete_thread = self.0.parent_id.is_some() && channel_guard.message_ids.is_empty();
                 delete_queue_local.append(&mut channel_guard.delete_queue);
                 drop(channel_guard);
+                // If the thread is empty, just delete the thread.
+                if delete_thread {
+                    let result = channel_id.delete(&http).await;
+                    if result.is_err() {
+                        error!("Error deleting thread: {:?}", result);
+                        // If we fail to delete, at least do the message deletions
+                    } else {
+                        continue;
+                    }
+                }
                 // Normally we shouldn't have an empty local queue, but it's possible
                 // because we're sleeping on Notify. But check if empty to save some
                 // work.
@@ -254,7 +265,7 @@ impl Channel {
                 if channel_guard.check_stopped(channel_id) {
                     channel_guard.delete_task_stopped = true;
                     break;
-                }
+                }                           
             }
         });
     }
