@@ -385,14 +385,11 @@ impl Channels {
 
 type DbUpdaterTx = mpsc::Sender<ChannelId>;
 type DbUpdaterRx = mpsc::Receiver<ChannelId>;
-type MessageLoggerTx = mpsc::Sender<(ChannelId, MessageId)>;
-type MessageLoggerRx = mpsc::Receiver<(ChannelId, MessageId)>;
 
 struct Data {
     // User data, which is stored and accessible in all command invocations
     channels: Channels,
     db_updater: DbUpdaterTx,
-    message_logger: MessageLoggerTx,
 }
 
 async fn fetch_archived_threads(
@@ -482,7 +479,6 @@ async fn fetch_threads(
 
 async fn fetch_message_history(
     db_updater: DbUpdaterTx,
-    message_logger: MessageLoggerTx,
     http: &impl CacheHttp,
     channel: Channel,
     direction: Direction,
@@ -545,13 +541,6 @@ async fn fetch_message_history(
             channel_id
         );
 
-        // Log to database
-        for message_id in &message_ids {
-            let result = message_logger.send((channel_id, *message_id));
-            if result.is_err() {
-                error!("Error sending message to logger: {:?}", result);
-            }
-        }
         // Add to the channel's data
         // The messages are currently going from newest to oldest, but we want
         // them in the opposite order, because that's how the channel data has
@@ -732,7 +721,6 @@ async fn add_or_update_channel(
         );
         fetch_message_history(
             data.db_updater.clone(),
-            data.message_logger.clone(),
             &http.clone(),
             channel,
             Direction::Before,
@@ -1002,18 +990,10 @@ async fn ready_handler(http: Arc<Http>, data: &Data, data_about_bot: &Ready) {
         drop(channel_guard);
         let http = http.clone();
         let db_updater = data.db_updater.clone();
-        let message_logger = data.message_logger.clone();
         tokio::spawn(async move {
-            fetch_message_history(
-                db_updater,
-                message_logger,
-                &http,
-                channel,
-                Direction::After,
-                last_seen,
-            )
-            .await
-            .unwrap();
+            fetch_message_history(db_updater, &http, channel, Direction::After, last_seen)
+                .await
+                .unwrap();
         });
     }
 }
@@ -1056,8 +1036,6 @@ async fn message_handler(data: &Data, new_message: &Message) -> Result<(), Error
         channel.0.expire_notify.notify_one();
     }
 
-    data.message_logger
-        .send((new_message.channel_id, new_message.id))?;
     Ok(())
 }
 
@@ -1170,38 +1148,6 @@ async fn wait_for_termination() {
             debug!("Received Ctrl+Shutdown");
         }
     }
-}
-
-fn message_logger_thread(rx: StdMutex<MessageLoggerRx>) {
-    thread::spawn(move || -> Result<(), Error> {
-        debug!("Started message logger thread");
-        let rx = rx.lock().unwrap();
-        debug!("Unlocked receiver mutex");
-        let mut db_connection = Connection::open(DB_PATH)?;
-        debug!("Opened database connection");
-        let mut ids = Vec::new();
-        loop {
-            ids.clear();
-            let tuple = rx
-                .recv()
-                .expect("Message logger channel should never close");
-            ids.push(tuple);
-            // See if there's more messages waiting
-            while let Ok(tuple) = rx.try_recv() {
-                ids.push(tuple);
-            }
-            debug!("Got {} messages to log", ids.len());
-            let tx = db_connection.transaction()?;
-            for (channel_id, message_id) in ids.iter() {
-                tx.execute(
-                    "INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)",
-                    params![channel_id.get() as i64, message_id.get() as i64],
-                )?;
-            }
-            tx.commit()?;
-            debug!("Logged messages to database");
-        }
-    });
 }
 
 async fn exit_handler(channels: Channels) {
@@ -1341,15 +1287,12 @@ async fn main() -> Result<(), Error> {
     drop(channels_query);
     drop(conn);
 
-    let (message_logger_tx, message_logger_rx) = mpsc::channel();
     let (db_updater_tx, db_updater_rx) = mpsc::channel();
     // Just so we can send them to the threads that needs to receive stuff
     let db_updater_rx = StdMutex::new(db_updater_rx);
-    let message_logger_rx = StdMutex::new(message_logger_rx);
 
     let token = env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
-    let intents =
-        GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS;
+    let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS;
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![autodelete()],
@@ -1375,14 +1318,11 @@ async fn main() -> Result<(), Error> {
                 let channels = Channels(Arc::new(RwLock::new(channels)));
                 // background thread for writing to database
                 db_updater_thread(db_updater_rx, channels.clone());
-                // background thread for logging message IDs
-                message_logger_thread(message_logger_rx);
                 // background task to handle exiting
                 exit_handler(channels.clone()).await;
                 let data = Data {
                     channels,
                     db_updater: db_updater_tx,
-                    message_logger: message_logger_tx,
                 };
                 Ok(data)
             })
