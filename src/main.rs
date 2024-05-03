@@ -544,7 +544,10 @@ async fn fetch_message_history(
 
         // Log to database
         for message_id in &message_ids {
-            message_logger.send((channel_id, *message_id)).unwrap();
+            let result = message_logger.send((channel_id, *message_id));
+            if result.is_err() {
+                error!("Error sending message to logger: {:?}", result);
+            }
         }
         // Add to the channel's data
         // The messages are currently going from newest to oldest, but we want
