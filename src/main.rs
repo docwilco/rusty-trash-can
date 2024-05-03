@@ -15,8 +15,8 @@ use itertools::Itertools;
 use log::{debug, error, info, trace, warn};
 use poise::serenity_prelude::{
     prelude::{Mutex, RwLock},
-    CacheHttp, ChannelId, ChannelType, ClientBuilder, FullEvent, GatewayIntents, GetMessages, GuildChannel, Http,
-    Message, MessageId, PartialGuildChannel, Ready, StatusCode, Timestamp,
+    CacheHttp, ChannelId, ChannelType, ClientBuilder, FullEvent, GatewayIntents, GetMessages,
+    GuildChannel, Http, Message, MessageId, PartialGuildChannel, Ready, StatusCode, Timestamp,
 };
 use poise::{say_reply, FrameworkContext};
 use pretty_duration::pretty_duration;
@@ -26,10 +26,10 @@ use std::fmt::{Display, Formatter};
 use std::sync::{mpsc, Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use std::{env, thread};
-use tokio::select;
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Notify;
+use tokio::{select, task::spawn_blocking};
 
 mod schema;
 
@@ -679,7 +679,8 @@ async fn start(
         max_messages,
         Some(reply_id),
     )
-    .await?;
+    .await
+    .unwrap();
     Ok(())
 }
 
@@ -724,7 +725,9 @@ async fn add_or_update_channel(
             None,
         )
         .await?;
-        fetch_threads(data, http, channel_id, max_age, max_messages).await?;
+        if parent_id.is_none() {
+            fetch_threads(data, http, channel_id, max_age, max_messages).await?;
+        }
     } else {
         // Since the max_age might have changed, wake up the expire task
         // so it can recalculate the sleep time.
@@ -1230,7 +1233,11 @@ async fn exit_handler(channels: Channels) {
                 channel_guard.message_ids.push_back(message_id);
             }
         }
-        save_all_message_ids_to_db(&mut db_connection, channels_local).unwrap();
+        spawn_blocking(move || {
+            save_all_message_ids_to_db(&mut db_connection, channels_local).unwrap()
+        })
+        .await
+        .unwrap();
         warn!("Saved message IDs, exiting due to signal.");
         std::process::exit(0);
     });
@@ -1361,7 +1368,8 @@ async fn main() -> Result<(), Error> {
         .build();
     let mut client = ClientBuilder::new(token, intents)
         .framework(framework)
-        .await.context(anyhow!("Client build failed"))?;
+        .await
+        .context(anyhow!("Client build failed"))?;
     info!("Initialization complete. Starting framework!");
     client.start().await.context("Client start failed")?;
     Ok(())
