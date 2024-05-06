@@ -899,15 +899,40 @@ fn save_channel_to_db(db_connection: &mut Connection, channel: Channel) -> Resul
     let channel_id = channel.0.channel_id;
     debug!("Saving settings & message IDs for {}", channel_id);
     let channel_guard = channel.0.inner.blocking_lock();
+    let channel_id = channel_id.get() as i64;
+    let parent_id = channel.0.parent_id.map(|x| x.get() as i64);
+    let max_age = channel_guard.max_age.map(|x| x.to_std().unwrap().as_secs() as i64);
+    let max_messages = channel_guard.max_messages.map(|x| x as i64);
+    let last_seen_message = channel_guard.last_seen_message.map(|x| x.get() as i64);
+    let bot_start_message = channel_guard.bot_start_message.map(|x| x.get() as i64);
+    let message_ids = channel_guard.message_ids.clone();
+    drop(channel_guard);
+    let insert_or_replace = "INSERT OR REPLACE INTO channel_settings (
+            channel_id,
+            parent_id,
+            max_age,
+            max_messages,
+            last_seen_message,
+            bot_start_message)
+        VALUES (?, ?, ?, ?, ?, ?)";
+    let params = params![
+        channel_id,
+        parent_id,
+        max_age,
+        max_messages,
+        last_seen_message,
+        bot_start_message
+    ];
     let tx = db_connection.transaction()?;
+    tx.execute(insert_or_replace, params)?;
     tx.execute(
         "DELETE FROM message_ids WHERE channel_id = ?",
-        [channel_id.get() as i64],
+        [channel_id],
     )?;
     let mut insert_id =
         tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
-    for message_id in channel_guard.message_ids.iter() {
-        insert_id.execute([channel_id.get() as i64, message_id.get() as i64])?;
+    for message_id in message_ids {
+        insert_id.execute([channel_id, message_id.get() as i64])?;
     }
     drop(insert_id);
     tx.commit()?;
