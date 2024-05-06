@@ -619,6 +619,18 @@ async fn autodelete(_ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+fn status_message(max_age: Option<TimeDelta>, max_messages: Option<u64>) -> String {
+    let max_age = max_age.map(|x| pretty_duration(&x.to_std().unwrap(), None));
+    match (max_age, max_messages) {
+        (Some(max_age), Some(max_messages)) => {
+            format!("max age: {}, max messages: {}", max_age, max_messages)
+        }
+        (None, Some(max_messages)) => format!("max messages: {}", max_messages),
+        (Some(max_age), None) => format!("max age: {}", max_age),
+        (None, None) => "Autodelete is not active".to_string(),
+    }
+}
+
 /// Set or update autodelete settings for the current channel
 ///
 /// This command has 2 arguments:
@@ -663,14 +675,7 @@ async fn start(
     if max_age.is_none() && max_messages.is_none() {
         return Err("Must specify at least one of max messages or max age".into());
     }
-    let message = match (max_age, max_messages) {
-        (Some(max_age), Some(max_messages)) => {
-            format!("max age: {}, max messages: {}", max_age, max_messages)
-        }
-        (None, Some(max_messages)) => format!("max messages: {}", max_messages),
-        (Some(max_age), None) => format!("max age: {}", pretty_duration(&max_age.to_std()?, None)),
-        (None, None) => unreachable!(),
-    };
+    let message = status_message(max_age, max_messages);
     info!("Updating settings for {}: {}", channel_id, message);
     let message = format!("Updating autodelete settings: {}", message);
     let reply = say_reply(ctx, message).await?;
@@ -794,14 +799,7 @@ async fn status(ctx: Context<'_>) -> Result<(), Error> {
     let message = match channel {
         Some(channel) => {
             let channel_guard = channel.0.inner.lock().await;
-            match (channel_guard.max_age, channel_guard.max_messages) {
-                (Some(max_age), Some(max_messages)) => {
-                    format!("max age: {}, max messages: {}", max_age, max_messages)
-                }
-                (None, Some(max_messages)) => format!("max messages: {}", max_messages),
-                (Some(max_age), None) => format!("max age: {}", max_age),
-                (None, None) => "Autodelete is not active".to_string(),
-            }
+            status_message(channel_guard.max_age, channel_guard.max_messages)
         }
         None => "Autodelete is not active".to_string(),
     };
