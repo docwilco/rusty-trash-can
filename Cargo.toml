@@ -9,7 +9,7 @@ edition = "2021"
 anyhow = "1.0.82"
 async-recursion = "1.0.5"
 chrono = "0.4.38"
-dotenv = "0.15.0"
+dotenvy = "0.15.7"
 duration-str = { version = "0.5.0", default-features = false, features = [
     "serde",
     "chrono",

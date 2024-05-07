@@ -516,7 +516,7 @@ async fn fetch_message_history(
             break;
         }
         for message in &messages {
-            debug!("Fetched message {}, kind: {:?}", message.id, message.kind);
+            trace!("Fetched message {}, kind: {:?}", message.id, message.kind);
         }
         if direction == Direction::After {
             origin = Some(messages.first().unwrap().id);
@@ -1236,7 +1236,7 @@ async fn exit_handler(channels: Channels) {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     env_logger::init();
     info!("Starting up");
 
