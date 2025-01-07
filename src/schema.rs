@@ -7,7 +7,7 @@ const VERSION_SCRIPTS: [(&str, &str); 2] = [
     ("schema v2", include_str!("schema_v2.sql")),
 ];
 
-pub fn check_and_upgrade_schema(conn: &mut Connection) -> Result<(), Error> {
+pub fn check_and_upgrade(conn: &mut Connection) -> Result<(), Error> {
     // Get user_version pragma
     let user_version: usize = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version == VERSION_SCRIPTS.len() {

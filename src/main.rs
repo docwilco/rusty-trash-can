@@ -1,6 +1,6 @@
 /// A Discord bot that deletes messages after a certain amount of time or when a maximum number of messages is reached.
 ///
-/// This is inspired by https://github.com/riking/AutoDelete
+/// This is inspired by <https://github.com/riking/AutoDelete>
 /// Its maintainer is on extended hiatus, so here's a rewrite in Rust.
 ///
 /// Some improvements over the original:
@@ -53,30 +53,29 @@ impl Display for Direction {
     }
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+enum TaskStatus {
+    #[default]
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+}
+
 #[derive(Debug, Default)]
 struct ChannelInner {
     max_age: Option<TimeDelta>,
-    max_messages: Option<u64>,
+    max_messages: Option<usize>,
     message_ids: VecDeque<MessageId>,
     delete_queue: Vec<MessageId>,
     last_seen_message: Option<MessageId>,
     bot_start_message: Option<MessageId>,
-    stop_tasks: bool,
-    delete_task_stopped: bool,
-    expire_task_stopped: bool,
+    delete_task_status: TaskStatus,
+    expire_task_status: TaskStatus,
     fetched_history: bool,
 }
 
 impl ChannelInner {
-    fn check_stopped(&mut self, channel_id: ChannelId) -> bool {
-        if self.stop_tasks {
-            debug!("Stopping delete task for channel {}", channel_id);
-            true
-        } else {
-            false
-        }
-    }
-
     fn check_expiry(&mut self) -> (usize, Option<TimeDelta>) {
         let mut expired = 0;
         let mut duration_to_next = None;
@@ -111,7 +110,7 @@ impl ChannelInner {
     fn check_max_messages(&mut self) -> usize {
         let mut moved_to_delete_queue = 0;
         if let Some(max_messages) = self.max_messages {
-            while self.message_ids.len() > max_messages as usize {
+            while self.message_ids.len() > max_messages {
                 self.delete_queue
                     .push(self.message_ids.pop_front().unwrap());
                 // If there's a max_age, the expire task might wake up
@@ -165,15 +164,17 @@ impl Channel {
         tokio::spawn(async move {
             let channel_id = self.0.channel_id;
             debug!("Starting delete task for channel {}", channel_id);
-            let mut stopping = false;
+            let mut channel_guard = self.0.inner.lock().await;
+            assert_eq!(channel_guard.delete_task_status, TaskStatus::Starting);
+            channel_guard.delete_task_status = TaskStatus::Running;
+            drop(channel_guard);
             loop {
                 // Wait at the top of the loop so we can use continue and still wait
                 self.0.delete_notify.notified().await;
                 debug!("Delete task for channel {} notified", channel_id);
                 let mut delete_queue_local = Vec::new();
                 let mut channel_guard = self.0.inner.lock().await;
-                if channel_guard.check_stopped(channel_id) {
-                    channel_guard.delete_task_stopped = true;
+                if channel_guard.delete_task_status == TaskStatus::Stopping {
                     break;
                 }
                 let delete_thread = self.0.parent_id.is_some()
@@ -211,35 +212,31 @@ impl Channel {
                     .partition::<Vec<_>, _>(|x| x.created_at() <= two_weeks_ago);
                 for chunk in delete_queue_bulk.chunks(100) {
                     let mut channel_guard = self.0.inner.lock().await;
-                    if stopping || channel_guard.check_stopped(channel_id) {
-                        stopping = true;
+                    if channel_guard.delete_task_status == TaskStatus::Stopping {
                         channel_guard.delete_queue.extend(chunk);
                         // not break, because we want further chunks returned as well
                         continue;
                     }
                     drop(channel_guard);
                     progress += chunk.len();
-                    match chunk.len() {
-                        1 => {
-                            delete_message_from_discord(
-                                &http, channel_id, chunk[0], &self, &progress, &total,
-                            )
-                            .await;
-                        }
-                        _ => {
-                            debug!(
-                                "Deleting {} messages in bulk (max per request is 100) [{}/{}]",
-                                chunk.len(),
-                                progress,
-                                total
-                            );
-                            let result = channel_id.delete_messages(&http, chunk.iter()).await;
-                            if result.is_err() {
-                                error!("Error deleting messages: {:?}", result);
-                                debug!("Putting messages back into delete queue");
-                                self.0.inner.lock().await.delete_queue.extend(chunk);
-                                self.0.delete_notify.notify_one();
-                            }
+                    if chunk.len() == 1 {
+                        delete_message_from_discord(
+                            &http, channel_id, chunk[0], &self, &progress, &total,
+                        )
+                        .await;
+                    } else {
+                        debug!(
+                            "Deleting {} messages in bulk (max per request is 100) [{}/{}]",
+                            chunk.len(),
+                            progress,
+                            total
+                        );
+                        let result = channel_id.delete_messages(&http, chunk.iter()).await;
+                        if result.is_err() {
+                            error!("Error deleting messages: {:?}", result);
+                            debug!("Putting messages back into delete queue");
+                            self.0.inner.lock().await.delete_queue.extend(chunk);
+                            self.0.delete_notify.notify_one();
                         }
                     }
                 }
@@ -252,7 +249,7 @@ impl Channel {
                         // This is a lock per message, but each delete_message might stall on
                         // rate limiting for quite a while. So we want to check between each delete.
                         let mut channel_guard = self.0.inner.lock().await;
-                        if channel_guard.check_stopped(channel_id) {
+                        if channel_guard.delete_task_status == TaskStatus::Stopping {
                             channel_guard.delete_queue.push(message_id);
                             // not break, because we want further messages returned as well
                             continue;
@@ -264,12 +261,14 @@ impl Channel {
                         .await;
                     }
                 }
-                let mut channel_guard = self.0.inner.lock().await;
-                if channel_guard.check_stopped(channel_id) {
-                    channel_guard.delete_task_stopped = true;
+                let channel_guard = self.0.inner.lock().await;
+                if channel_guard.delete_task_status == TaskStatus::Stopping {
                     break;
                 }
             }
+            debug!("Delete task for channel {} stopped", channel_id);
+            let mut channel_guard = self.0.inner.lock().await;
+            channel_guard.delete_task_status = TaskStatus::Stopped;
         });
     }
 
@@ -278,11 +277,14 @@ impl Channel {
         tokio::spawn(async move {
             let channel_id = self.0.channel_id;
             debug!("Starting expire task for channel {}", channel_id);
+            let mut channel_guard = self.0.inner.lock().await;
+            assert_eq!(channel_guard.expire_task_status, TaskStatus::Starting);
+            channel_guard.expire_task_status = TaskStatus::Running;
+            drop(channel_guard);
             loop {
                 let mut channel_guard = self.0.inner.lock().await;
-                if channel_guard.stop_tasks {
+                if channel_guard.expire_task_status == TaskStatus::Stopping {
                     debug!("Stopping expire task for channel {}", channel_id);
-                    channel_guard.expire_task_stopped = true;
                     break;
                 }
                 let (expired, sleep_time) = channel_guard.check_expiry();
@@ -292,34 +294,50 @@ impl Channel {
                 }
                 drop(channel_guard);
                 // Sleep at least 1 second, so that deletes can possibly be grouped
-                let sleep_time = sleep_time
-                    .map(|x| {
-                        if x < TimeDelta::seconds(1) {
-                            TimeDelta::seconds(1)
-                        } else {
-                            x
-                        }
-                    })
-                    .unwrap_or(TimeDelta::MAX);
+                let sleep_time = sleep_time.map_or(TimeDelta::MAX, |x| {
+                    if x < TimeDelta::seconds(1) {
+                        TimeDelta::seconds(1)
+                    } else {
+                        x
+                    }
+                });
                 debug!(
                     "Expire task sleeping for {} for channel {}",
                     if sleep_time == TimeDelta::MAX {
                         "forever".to_string()
                     } else {
-                        format!("{:?} seconds", sleep_time)
+                        format!("{sleep_time:?} seconds")
                     },
                     channel_id
                 );
                 select! {
-                    _ = tokio::time::sleep(sleep_time.to_std().unwrap()) => {
-                        debug!("Expire task for channel {} woke up", channel_id);
+                    () = tokio::time::sleep(sleep_time.to_std().unwrap()) => {
+                        debug!("Expire task for channel {channel_id} woke up");
                     }
-                    _ = self.0.expire_notify.notified() => {
-                        debug!("Expire task for channel {} notified", channel_id);
+                    () = self.0.expire_notify.notified() => {
+                        debug!("Expire task for channel {channel_id} notified");
                     }
                 };
             }
+            debug!("Expire task for channel {} stopped", channel_id);
+            let mut channel_guard = self.0.inner.lock().await;
+            channel_guard.expire_task_status = TaskStatus::Stopped;
         });
+    }
+
+    async fn stop_tasks(&self) {
+        let mut channel_guard = self.0.inner.lock().await;
+        channel_guard.delete_task_status = TaskStatus::Stopping;
+        channel_guard.expire_task_status = TaskStatus::Stopping;
+        drop(channel_guard);
+        self.0.delete_notify.notify_one();
+        self.0.expire_notify.notify_one();
+    }
+
+    async fn tasks_stopped(&self) -> bool {
+        let channel_guard = self.0.inner.lock().await;
+        channel_guard.delete_task_status == TaskStatus::Stopped
+            && channel_guard.expire_task_status == TaskStatus::Stopped
     }
 }
 
@@ -337,13 +355,12 @@ impl Channels {
         // we can just lock with `write()`, and not worry about race conditions
         // between the `get()` and `insert()`.
         let mut channels = self.0.write().await;
-        match channels.get(&channel_id).cloned() {
-            Some(channel) => channel,
-            None => {
-                let channel = Channel::new(http, channel_id, parent_id, ChannelInner::default());
-                channels.insert(channel_id, channel.clone());
-                channel
-            }
+        if let Some(channel) = channels.get(&channel_id).cloned() {
+            channel
+        } else {
+            let channel = Channel::new(http, channel_id, parent_id, ChannelInner::default());
+            channels.insert(channel_id, channel.clone());
+            channel
         }
     }
 
@@ -358,9 +375,7 @@ impl Channels {
     async fn remove(&self, channel_id: ChannelId) -> Option<Channel> {
         let channel = self.0.write().await.remove(&channel_id);
         if let Some(ref channel) = channel {
-            channel.0.inner.lock().await.stop_tasks = true;
-            channel.0.delete_notify.notify_one();
-            channel.0.expire_notify.notify_one();
+            channel.stop_tasks().await;
         }
         channel
     }
@@ -411,11 +426,14 @@ async fn fetch_archived_threads(
         };
         debug!("Got {} archived threads", threadsdata.threads.len());
         before = threadsdata.threads.last().map(|t| {
-            t.thread_metadata
-                .unwrap()
-                .archive_timestamp
-                .unwrap()
-                .unix_timestamp() as u64
+            u64::try_from(
+                t.thread_metadata
+                    .unwrap()
+                    .archive_timestamp
+                    .unwrap()
+                    .unix_timestamp(),
+            )
+            .unwrap()
         });
         threads.extend(threadsdata.threads);
         if !threadsdata.has_more {
@@ -431,7 +449,7 @@ async fn fetch_threads(
     http: Arc<Http>,
     channel_id: ChannelId,
     max_age: Option<TimeDelta>,
-    max_messages: Option<u64>,
+    max_messages: Option<usize>,
 ) -> Result<(), Error> {
     let guild_id = channel_id
         .to_channel(&http)
@@ -592,18 +610,21 @@ async fn fetch_message_history(
 ///
 /// Doesn't do anything since we're slash commands only now, and slash commands
 /// can't do toplevel if there's subs.
+///
+// Commands must be async, but this is empty. 
+#[allow(clippy::unused_async)]
 async fn autodelete(_ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-fn status_message(max_age: Option<TimeDelta>, max_messages: Option<u64>) -> String {
+fn status_message(max_age: Option<TimeDelta>, max_messages: Option<usize>) -> String {
     let max_age = max_age.map(|x| pretty_duration(&x.to_std().unwrap(), None));
     match (max_age, max_messages) {
         (Some(max_age), Some(max_messages)) => {
-            format!("max age: {}, max messages: {}", max_age, max_messages)
+            format!("max age: {max_age}, max messages: {max_messages}")
         }
-        (None, Some(max_messages)) => format!("max messages: {}", max_messages),
-        (Some(max_age), None) => format!("max age: {}", max_age),
+        (None, Some(max_messages)) => format!("max messages: {max_messages}"),
+        (Some(max_age), None) => format!("max age: {max_age}"),
         (None, None) => "Autodelete is not active".to_string(),
     }
 }
@@ -630,7 +651,7 @@ fn status_message(max_age: Option<TimeDelta>, max_messages: Option<u64>) -> Stri
 async fn start(
     ctx: Context<'_>,
     #[description = "Max age of messages"] max_age: Option<String>,
-    #[description = "Max number of messages to keep"] max_messages: Option<u64>,
+    #[description = "Max number of messages to keep"] max_messages: Option<usize>,
 ) -> Result<(), Error> {
     let channel_id = ctx.channel_id();
     // Should not be PrivateChannel or ChannelCategory
@@ -654,7 +675,7 @@ async fn start(
     }
     let message = status_message(max_age, max_messages);
     info!("Updating settings for {}: {}", channel_id, message);
-    let message = format!("Updating autodelete settings: {}", message);
+    let message = format!("Updating autodelete settings: {message}");
     let reply = say_reply(ctx, message).await?;
     let reply_id = reply.message().await?.id;
     let http = ctx.serenity_context().http.clone();
@@ -678,7 +699,7 @@ async fn add_or_update_channel(
     channel_id: ChannelId,
     parent_id: Option<ChannelId>,
     max_age: Option<TimeDelta>,
-    max_messages: Option<u64>,
+    max_messages: Option<usize>,
     bot_start_message: Option<MessageId>,
 ) -> Result<(), Error> {
     debug!("Adding or updating channel {}", channel_id);
@@ -810,7 +831,7 @@ async fn delete_message_from_discord(
             channel.0.inner.lock().await.delete_queue.push(message_id);
             channel.0.delete_notify.notify_one();
         }
-        Ok(_) => {}
+        Ok(()) => {}
     }
 }
 
@@ -844,7 +865,7 @@ fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
                         Ok(channel_id) => {
                             let channel = channels.blocking_get(channel_id);
                             if let Some(channel) = channel {
-                                save_channel_to_db(&mut db_connection, channel)?;
+                                save_channel_to_db(&mut db_connection, &channel)?;
                             } else {
                                 delete_channel_from_db(&mut db_connection, channel_id)?;
                             }
@@ -862,7 +883,7 @@ fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
                     next_save += interval;
                     save_all_message_ids_to_db(
                         &mut db_connection,
-                        channels.blocking_to_cloned_vec(),
+                        &channels.blocking_to_cloned_vec(),
                     )?;
                 }
             }
@@ -872,13 +893,17 @@ fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
     });
 }
 
-fn save_channel_to_db(db_connection: &mut Connection, channel: Channel) -> Result<(), Error> {
+// SQLite doesn't support unsigned integers, so we have to cast them to signed and back
+#[allow(clippy::cast_possible_wrap)]
+fn save_channel_to_db(db_connection: &mut Connection, channel: &Channel) -> Result<(), Error> {
     let channel_id = channel.0.channel_id;
     debug!("Saving settings & message IDs for {}", channel_id);
     let channel_guard = channel.0.inner.blocking_lock();
     let channel_id = channel_id.get() as i64;
     let parent_id = channel.0.parent_id.map(|x| x.get() as i64);
-    let max_age = channel_guard.max_age.map(|x| x.to_std().unwrap().as_secs() as i64);
+    let max_age = channel_guard
+        .max_age
+        .map(|x| x.to_std().unwrap().as_secs() as i64);
     let max_messages = channel_guard.max_messages.map(|x| x as i64);
     let last_seen_message = channel_guard.last_seen_message.map(|x| x.get() as i64);
     let bot_start_message = channel_guard.bot_start_message.map(|x| x.get() as i64);
@@ -902,10 +927,7 @@ fn save_channel_to_db(db_connection: &mut Connection, channel: Channel) -> Resul
     ];
     let tx = db_connection.transaction()?;
     tx.execute(insert_or_replace, params)?;
-    tx.execute(
-        "DELETE FROM message_ids WHERE channel_id = ?",
-        [channel_id],
-    )?;
+    tx.execute("DELETE FROM message_ids WHERE channel_id = ?", [channel_id])?;
     let mut insert_id =
         tx.prepare("INSERT INTO message_ids (channel_id, message_id) VALUES (?, ?)")?;
     for message_id in message_ids {
@@ -917,6 +939,8 @@ fn save_channel_to_db(db_connection: &mut Connection, channel: Channel) -> Resul
     Ok(())
 }
 
+// SQLite doesn't support unsigned integers, so we have to cast them to signed and back
+#[allow(clippy::cast_possible_wrap)]
 fn delete_channel_from_db(
     db_connection: &mut Connection,
     channel_id: ChannelId,
@@ -936,19 +960,21 @@ fn delete_channel_from_db(
     Ok(())
 }
 
+// SQLite doesn't support unsigned integers, so we have to cast them to signed and back
+#[allow(clippy::cast_possible_wrap)]
 // This doesn't use `save_message_ids` so that the DELETE is a single statement
 // without WHERE clause, which sqlite can optimize. Also that way it's a single
 // transaction for the whole thing.
 fn save_all_message_ids_to_db(
     db_connection: &mut Connection,
-    channels_local: Vec<(ChannelId, Channel)>,
+    channels_local: &[(ChannelId, Channel)],
 ) -> Result<(), Error> {
     // First we build up an in memory list of all data we want to save, so that
     // we don't have to wait on locks while writing to the database.
     let mut all_ids = Vec::new();
     let mut all_last_seens = Vec::new();
     // Using for loop because async closures aren't stable yet
-    for (channel_id, channel) in &channels_local {
+    for (channel_id, channel) in channels_local {
         let channel_guard = channel.0.inner.blocking_lock();
         for message_id in &channel_guard.message_ids {
             all_ids.push((*channel_id, *message_id));
@@ -1004,12 +1030,9 @@ async fn message_handler(data: &Data, new_message: &Message) -> Result<(), Error
         new_message.id, new_message.channel_id
     );
     let channel = data.channels.get(new_message.channel_id).await;
-    let channel = match channel {
-        Some(channel) => channel,
-        None => {
-            debug!("Ignoring message in channel without settings");
-            return Ok(());
-        }
+    let Some(channel) = channel else {
+        debug!("Ignoring message in channel without settings");
+        return Ok(());
     };
     let mut channel_guard = channel.0.inner.lock().await;
     if channel_guard.max_age.is_none() && channel_guard.max_messages.is_none() {
@@ -1052,12 +1075,9 @@ async fn thread_create_handler(
         thread.id, parent_id
     );
     let channel = data.channels.get(parent_id).await;
-    let channel = match channel {
-        Some(channel) => channel,
-        None => {
-            debug!("Ignoring thread create in channel without settings");
-            return Ok(());
-        }
+    let Some(channel) = channel else {
+        debug!("Ignoring thread create in channel without settings");
+        return Ok(());
     };
     let channel_guard = channel.0.inner.lock().await;
     let max_age = channel_guard.max_age;
@@ -1150,7 +1170,7 @@ async fn wait_for_termination() {
     }
 }
 
-async fn exit_handler(channels: Channels) {
+fn exit_handler(all_channels: Channels) {
     tokio::spawn(async move {
         // This is not async, but we're at startup, so a hiccup is acceptable
         let mut db_connection = Connection::open(DB_PATH).unwrap();
@@ -1161,28 +1181,23 @@ async fn exit_handler(channels: Channels) {
         // we exit.
         // Also, we keep doing everything async until it's time to write to the
         // database, so that we avoid deadlocks.
-        let channels_guard = channels.0.write().await;
-        let channels_local = channels_guard
+        let all_channels_guard = all_channels.0.write().await;
+        let all_channels_local = all_channels_guard
             .iter()
             .map(|(id, channel)| (*id, channel.clone()))
             .collect::<Vec<_>>();
         // Stop the tasks on the channels
         debug!("Stopping tasks");
-        for (_, channel) in channels_local.iter() {
-            let mut channel_guard = channel.0.inner.lock().await;
-            channel_guard.stop_tasks = true;
-            channel.0.delete_notify.notify_one();
-            channel.0.expire_notify.notify_one();
+        for (_, channel) in &all_channels_local {
+            channel.stop_tasks().await;
         }
         // Wait for all the channels' tasks to finish
         debug!("Waiting for tasks to finish...");
-        for (_, channel) in channels_local.iter() {
+        for (_, channel) in &all_channels_local {
             loop {
-                let channel_guard = channel.0.inner.lock().await;
-                if channel_guard.delete_task_stopped && channel_guard.expire_task_stopped {
+                if channel.tasks_stopped().await {
                     break;
                 }
-                drop(channel_guard);
                 debug!("Waiting for tasks to finish (100ms sleep)");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -1190,7 +1205,7 @@ async fn exit_handler(channels: Channels) {
         debug!("Tasks finished");
         // Return messages from delete queues to message IDs
         debug!("Returning messages from delete queues");
-        for (channel_id, channel) in channels_local.iter() {
+        for (channel_id, channel) in &all_channels_local {
             let mut channel_guard = channel.0.inner.lock().await;
             debug!(
                 "Channel {} has {} messages in delete queue",
@@ -1202,7 +1217,7 @@ async fn exit_handler(channels: Channels) {
             }
         }
         spawn_blocking(move || {
-            save_all_message_ids_to_db(&mut db_connection, channels_local).unwrap()
+            save_all_message_ids_to_db(&mut db_connection, &all_channels_local).unwrap();
         })
         .await
         .unwrap();
@@ -1212,13 +1227,16 @@ async fn exit_handler(channels: Channels) {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
+// SQLite doesn't support unsigned integers, so we have to cast them to signed and back
+#[allow(clippy::cast_sign_loss)]
 async fn main() -> Result<(), Error> {
     dotenvy::dotenv().ok();
     env_logger::init();
     info!("Starting up");
 
     let mut conn = Connection::open(DB_PATH)?;
-    schema::check_and_upgrade_schema(&mut conn)?;
+    schema::check_and_upgrade(&mut conn)?;
 
     let mut channels_query = conn.prepare(
         "SELECT channel_id,
@@ -1242,7 +1260,7 @@ async fn main() -> Result<(), Error> {
                 parent_id.map(|id| ChannelId::new(id as u64)),
                 ChannelInner {
                     max_age: max_age.map(TimeDelta::seconds),
-                    max_messages: max_messages.map(|x| x as u64),
+                    max_messages: max_messages.map(|x| usize::try_from(x).unwrap()),
                     last_seen_message: last_seen_message.map(|id| MessageId::from(id as u64)),
                     bot_start_message: bot_start_message.map(|id| MessageId::from(id as u64)),
                     ..Default::default()
@@ -1253,12 +1271,13 @@ async fn main() -> Result<(), Error> {
 
     info!("Loaded channel settings from database");
     debug!("Channel settings:");
-    channels
-        .iter()
-        .for_each(|(id, parent_id, inner)| match parent_id {
-            Some(parent) => debug!("{} (parent: {}): {:?}", id, parent, inner),
-            None => debug!("{}: {:?}", id, inner),
-        });
+    for (id, parent_id, inner) in &channels {
+        if let Some(parent) = parent_id {
+            debug!("{id} (parent: {parent}): {inner:?}");
+        } else {
+            debug!("{id}: {inner:?}");
+        }
+    }
 
     let mut message_ids_query = conn.prepare(
         "SELECT channel_id, message_id
@@ -1319,7 +1338,7 @@ async fn main() -> Result<(), Error> {
                 // background thread for writing to database
                 db_updater_thread(db_updater_rx, channels.clone());
                 // background task to handle exiting
-                exit_handler(channels.clone()).await;
+                exit_handler(channels.clone());
                 let data = Data {
                     channels,
                     db_updater: db_updater_tx,
