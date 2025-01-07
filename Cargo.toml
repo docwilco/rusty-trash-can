@@ -6,25 +6,25 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.82"
-async-recursion = "1.0.5"
-chrono = "0.4.38"
+anyhow = "1.0.95"
+async-recursion = "1.1.1"
+chrono = "0.4.39"
 dotenvy = "0.15.7"
-duration-str = { version = "0.5.0", default-features = false, features = [
+duration-str = { version = "0.12.0", default-features = false, features = [
     "serde",
     "chrono",
 ] }
-env_logger = "0.10.0"
-futures = "0.3.28"
-itertools = "0.10.5"
-log = "0.4.17"
+env_logger = "0.11.6"
+futures = "0.3.31"
+itertools = "0.14.0"
+log = "0.4.22"
 poise = { git = "https://github.com/serenity-rs/poise.git", branch = "next", default-features = false, features = [
     "chrono",
     "cache",
 ] }
 pretty-duration = "0.1.1"
-rusqlite = { version = "0.29.0", features = ["backup", "bundled"] }
-serenity = { version = "0.12.0", default-features = false, features = [
+rusqlite = { version = "0.32.1", features = ["backup", "bundled"] }
+serenity = { version = "0.12.4", default-features = false, features = [
     "cache",
     "client",
     "gateway",
@@ -33,8 +33,8 @@ serenity = { version = "0.12.0", default-features = false, features = [
     "model",
     "chrono",
 ] }
-tokio = { version = "1.28.0", features = ["macros", "rt-multi-thread", "signal"] }
-tokio-rusqlite = "0.4.0"
+tokio = { version = "1.42.0", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-rusqlite = "0.6.0"
 
 [profile.release]
 incremental = true

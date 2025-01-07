@@ -300,10 +300,10 @@ impl Channel {
                             x
                         }
                     })
-                    .unwrap_or(TimeDelta::max_value());
+                    .unwrap_or(TimeDelta::MAX);
                 debug!(
                     "Expire task sleeping for {} for channel {}",
-                    if sleep_time == TimeDelta::max_value() {
+                    if sleep_time == TimeDelta::MAX {
                         "forever".to_string()
                     } else {
                         format!("{:?} seconds", sleep_time)
@@ -587,30 +587,7 @@ async fn fetch_message_history(
     Ok(())
 }
 
-/// Show help for the autodelete command
-#[poise::command(slash_command)]
-async fn help(
-    ctx: Context<'_>,
-    #[description = "Specific command to show help about"] mut command: Option<String>,
-) -> Result<(), Error> {
-    // This makes it possible to just make `help` a subcommand of any command
-    // `/autodelete help` turns into `/help autodelete`
-    // `/autodelete help start` turns into `/help autodelete start`
-    if ctx.invoked_command_name() != "help" {
-        command = match command {
-            Some(c) => Some(format!("{} {}", ctx.invoked_command_name(), c)),
-            None => Some(ctx.invoked_command_name().to_string()),
-        };
-    }
-    let config = poise::builtins::HelpConfiguration {
-        show_subcommands: true,
-        ..Default::default()
-    };
-    poise::builtins::help(ctx, command.as_deref(), config).await?;
-    Ok(())
-}
-
-#[poise::command(slash_command, subcommands("start", "stop", "status", "help"))]
+#[poise::command(slash_command, subcommands("start", "stop", "status"))]
 /// The bot's main entry point.
 ///
 /// Doesn't do anything since we're slash commands only now, and slash commands
