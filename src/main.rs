@@ -13,23 +13,27 @@ use async_recursion::async_recursion;
 use chrono::{TimeDelta, Utc};
 use itertools::Itertools;
 use log::{debug, error, info, trace, warn};
-use poise::serenity_prelude::{
-    prelude::{Mutex, RwLock},
-    CacheHttp, ChannelId, ChannelType, ClientBuilder, FullEvent, GatewayIntents, GetMessages,
-    GuildChannel, Http, Message, MessageId, PartialGuildChannel, Ready, StatusCode, Timestamp,
+use poise::{
+    say_reply,
+    serenity_prelude::{
+        CacheHttp, ChannelId, ChannelType, ClientBuilder, FullEvent, GatewayIntents, GetMessages,
+        GuildChannel, Http, Message, MessageId, PartialGuildChannel, Ready, StatusCode, Timestamp,
+    },
+    FrameworkContext,
 };
-use poise::{say_reply, FrameworkContext};
 use pretty_duration::pretty_duration;
 use rusqlite::{params, Connection};
-use std::collections::{HashMap, VecDeque};
-use std::fmt::{Display, Formatter};
-use std::sync::{mpsc, Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
-use std::{env, thread};
+use std::{
+    collections::{HashMap, VecDeque},
+    env,
+    fmt::{Display, Formatter},
+    sync::{mpsc, Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 #[cfg(unix)]
 use tokio::signal::unix::SignalKind;
-use tokio::sync::Notify;
-use tokio::{select, task::spawn_blocking};
+use tokio::{select, sync::Notify};
 
 mod schema;
 
@@ -144,6 +148,7 @@ impl Channel {
         channel_id: ChannelId,
         parent_id: Option<ChannelId>,
         inner: ChannelInner,
+        runtime: &Arc<tokio::runtime::Runtime>,
     ) -> Self {
         let channel = Channel(Arc::new(ChannelOuter {
             channel_id,
@@ -152,36 +157,38 @@ impl Channel {
             delete_notify: Notify::new(),
             expire_notify: Notify::new(),
         }));
-        channel.clone().expire_task();
-        channel.clone().delete_task(http);
+        channel.clone().expire_task(runtime);
+        channel.clone().delete_task(http, runtime);
         channel
     }
 
     // Background task to delete messages
     // This is intentionally separate from the delete queue, to try and get as
     // few actual delete calls as possible, using bulk deletes.
-    fn delete_task(self, http: Arc<Http>) {
-        tokio::spawn(async move {
+    fn delete_task(self, http: Arc<Http>, runtime: &Arc<tokio::runtime::Runtime>) {
+        runtime.spawn(async move {
             let channel_id = self.0.channel_id;
             debug!("Starting delete task for channel {}", channel_id);
-            let mut channel_guard = self.0.inner.lock().await;
-            assert_eq!(channel_guard.delete_task_status, TaskStatus::Starting);
-            channel_guard.delete_task_status = TaskStatus::Running;
-            drop(channel_guard);
+            {
+                let mut channel_guard = self.0.inner.lock().unwrap();
+                assert_eq!(channel_guard.delete_task_status, TaskStatus::Starting);
+                channel_guard.delete_task_status = TaskStatus::Running;
+            }
             loop {
                 // Wait at the top of the loop so we can use continue and still wait
                 self.0.delete_notify.notified().await;
                 debug!("Delete task for channel {} notified", channel_id);
                 let mut delete_queue_local = Vec::new();
-                let mut channel_guard = self.0.inner.lock().await;
-                if channel_guard.delete_task_status == TaskStatus::Stopping {
-                    break;
-                }
-                let delete_thread = self.0.parent_id.is_some()
-                    && channel_guard.fetched_history
-                    && channel_guard.message_ids.is_empty();
-                delete_queue_local.append(&mut channel_guard.delete_queue);
-                drop(channel_guard);
+                let delete_thread = {
+                    let mut channel_guard = self.0.inner.lock().unwrap();
+                    if channel_guard.delete_task_status == TaskStatus::Stopping {
+                        break;
+                    }
+                    delete_queue_local.append(&mut channel_guard.delete_queue);
+                    self.0.parent_id.is_some()
+                        && channel_guard.fetched_history
+                        && channel_guard.message_ids.is_empty()
+                };
                 // If the thread is empty, just delete the thread.
                 if delete_thread {
                     let result = channel_id.delete(&http).await;
@@ -211,13 +218,14 @@ impl Channel {
                     .into_iter()
                     .partition::<Vec<_>, _>(|x| x.created_at() <= two_weeks_ago);
                 for chunk in delete_queue_bulk.chunks(100) {
-                    let mut channel_guard = self.0.inner.lock().await;
-                    if channel_guard.delete_task_status == TaskStatus::Stopping {
-                        channel_guard.delete_queue.extend(chunk);
-                        // not break, because we want further chunks returned as well
-                        continue;
+                    {
+                        let mut channel_guard = self.0.inner.lock().unwrap();
+                        if channel_guard.delete_task_status == TaskStatus::Stopping {
+                            channel_guard.delete_queue.extend(chunk);
+                            // not break, because we want further chunks returned as well
+                            continue;
+                        }
                     }
-                    drop(channel_guard);
                     progress += chunk.len();
                     if chunk.len() == 1 {
                         delete_message_from_discord(
@@ -235,7 +243,7 @@ impl Channel {
                         if result.is_err() {
                             error!("Error deleting messages: {:?}", result);
                             debug!("Putting messages back into delete queue");
-                            self.0.inner.lock().await.delete_queue.extend(chunk);
+                            self.0.inner.lock().unwrap().delete_queue.extend(chunk);
                             self.0.delete_notify.notify_one();
                         }
                     }
@@ -248,51 +256,57 @@ impl Channel {
                     for message_id in delete_queue_non_bulk {
                         // This is a lock per message, but each delete_message might stall on
                         // rate limiting for quite a while. So we want to check between each delete.
-                        let mut channel_guard = self.0.inner.lock().await;
-                        if channel_guard.delete_task_status == TaskStatus::Stopping {
-                            channel_guard.delete_queue.push(message_id);
-                            // not break, because we want further messages returned as well
-                            continue;
+                        {
+                            let mut channel_guard = self.0.inner.lock().unwrap();
+                            if channel_guard.delete_task_status == TaskStatus::Stopping {
+                                channel_guard.delete_queue.push(message_id);
+                                // not break, because we want further messages returned as well
+                                continue;
+                            }
                         }
-                        drop(channel_guard);
                         delete_message_from_discord(
                             &http, channel_id, message_id, &self, &progress, &total,
                         )
                         .await;
                     }
                 }
-                let channel_guard = self.0.inner.lock().await;
+                let channel_guard = self.0.inner.lock().unwrap();
                 if channel_guard.delete_task_status == TaskStatus::Stopping {
                     break;
                 }
             }
             debug!("Delete task for channel {} stopped", channel_id);
-            let mut channel_guard = self.0.inner.lock().await;
+            let mut channel_guard = self.0.inner.lock().unwrap();
             channel_guard.delete_task_status = TaskStatus::Stopped;
         });
     }
 
-    // background task to put expired messages in the delete queue
-    fn expire_task(self) {
-        tokio::spawn(async move {
+    // Background task to put expired messages in the delete queue.
+    //
+    // This needs to go on a separate runtime because of reasons in exit_handler
+    fn expire_task(self, runtime: &Arc<tokio::runtime::Runtime>) {
+        runtime.spawn(async move {
             let channel_id = self.0.channel_id;
             debug!("Starting expire task for channel {}", channel_id);
-            let mut channel_guard = self.0.inner.lock().await;
-            assert_eq!(channel_guard.expire_task_status, TaskStatus::Starting);
-            channel_guard.expire_task_status = TaskStatus::Running;
-            drop(channel_guard);
+            {
+                let mut channel_guard = self.0.inner.lock().unwrap();
+                assert_eq!(channel_guard.expire_task_status, TaskStatus::Starting);
+                channel_guard.expire_task_status = TaskStatus::Running;
+            }
             loop {
-                let mut channel_guard = self.0.inner.lock().await;
-                if channel_guard.expire_task_status == TaskStatus::Stopping {
-                    debug!("Stopping expire task for channel {}", channel_id);
-                    break;
-                }
-                let (expired, sleep_time) = channel_guard.check_expiry();
-                if expired > 0 || !channel_guard.delete_queue.is_empty() {
-                    debug!("{} messages expired in channel {}", expired, channel_id);
-                    self.0.delete_notify.notify_one();
-                }
-                drop(channel_guard);
+                let sleep_time = {
+                    let mut channel_guard = self.0.inner.lock().unwrap();
+                    if channel_guard.expire_task_status == TaskStatus::Stopping {
+                        debug!("Stopping expire task for channel {}", channel_id);
+                        break;
+                    }
+                    let (expired, sleep_time) = channel_guard.check_expiry();
+                    if expired > 0 || !channel_guard.delete_queue.is_empty() {
+                        debug!("{} messages expired in channel {}", expired, channel_id);
+                        self.0.delete_notify.notify_one();
+                    }
+                    sleep_time
+                };
                 // Sleep at least 1 second, so that deletes can possibly be grouped
                 let sleep_time = sleep_time.map_or(TimeDelta::MAX, |x| {
                     if x < TimeDelta::seconds(1) {
@@ -320,13 +334,13 @@ impl Channel {
                 };
             }
             debug!("Expire task for channel {} stopped", channel_id);
-            let mut channel_guard = self.0.inner.lock().await;
+            let mut channel_guard = self.0.inner.lock().unwrap();
             channel_guard.expire_task_status = TaskStatus::Stopped;
         });
     }
 
-    async fn stop_tasks(&self) {
-        let mut channel_guard = self.0.inner.lock().await;
+    fn stop_tasks(&self) {
+        let mut channel_guard = self.0.inner.lock().unwrap();
         channel_guard.delete_task_status = TaskStatus::Stopping;
         channel_guard.expire_task_status = TaskStatus::Stopping;
         drop(channel_guard);
@@ -334,64 +348,53 @@ impl Channel {
         self.0.expire_notify.notify_one();
     }
 
-    async fn tasks_stopped(&self) -> bool {
-        let channel_guard = self.0.inner.lock().await;
+    fn tasks_stopped(&self) -> bool {
+        let channel_guard = self.0.inner.lock().unwrap();
         channel_guard.delete_task_status == TaskStatus::Stopped
             && channel_guard.expire_task_status == TaskStatus::Stopped
     }
 }
 
 #[derive(Clone, Debug, Default)]
-struct Channels(Arc<RwLock<HashMap<ChannelId, Channel>>>);
+struct Channels(Arc<Mutex<HashMap<ChannelId, Channel>>>);
 
 impl Channels {
-    async fn get_or_default(
+    fn get_or_default(
         &self,
         http: Arc<Http>,
         channel_id: ChannelId,
         parent_id: Option<ChannelId>,
+        runtime: &Arc<tokio::runtime::Runtime>,
     ) -> Channel {
         // Since this is only called when changing a channel's setting now,
         // we can just lock with `write()`, and not worry about race conditions
         // between the `get()` and `insert()`.
-        let mut channels = self.0.write().await;
+        let mut channels = self.0.lock().unwrap();
         if let Some(channel) = channels.get(&channel_id).cloned() {
             channel
         } else {
-            let channel = Channel::new(http, channel_id, parent_id, ChannelInner::default());
+            let channel = Channel::new(http, channel_id, parent_id, ChannelInner::default(), runtime);
             channels.insert(channel_id, channel.clone());
             channel
         }
     }
 
-    async fn get(&self, channel_id: ChannelId) -> Option<Channel> {
-        self.0.read().await.get(&channel_id).cloned()
+    fn get(&self, channel_id: ChannelId) -> Option<Channel> {
+        self.0.lock().unwrap().get(&channel_id).cloned()
     }
 
-    fn blocking_get(&self, channel_id: ChannelId) -> Option<Channel> {
-        self.0.blocking_read().get(&channel_id).cloned()
-    }
-
-    async fn remove(&self, channel_id: ChannelId) -> Option<Channel> {
-        let channel = self.0.write().await.remove(&channel_id);
+    fn remove(&self, channel_id: ChannelId) -> Option<Channel> {
+        let channel = self.0.lock().unwrap().remove(&channel_id);
         if let Some(ref channel) = channel {
-            channel.stop_tasks().await;
+            channel.stop_tasks();
         }
         channel
     }
 
-    async fn to_cloned_vec(&self) -> Vec<(ChannelId, Channel)> {
+    fn to_cloned_vec(&self) -> Vec<(ChannelId, Channel)> {
         self.0
-            .read()
-            .await
-            .iter()
-            .map(|(channel_id, channel)| (*channel_id, channel.clone()))
-            .collect()
-    }
-
-    fn blocking_to_cloned_vec(&self) -> Vec<(ChannelId, Channel)> {
-        self.0
-            .blocking_read()
+            .lock()
+            .unwrap()
             .iter()
             .map(|(channel_id, channel)| (*channel_id, channel.clone()))
             .collect()
@@ -402,6 +405,7 @@ type DbUpdaterTx = mpsc::Sender<ChannelId>;
 type DbUpdaterRx = mpsc::Receiver<ChannelId>;
 
 struct Data {
+    background_task_runtime: Arc<tokio::runtime::Runtime>,
     // User data, which is stored and accessible in all command invocations
     channels: Channels,
     db_updater: DbUpdaterTx,
@@ -503,7 +507,7 @@ async fn fetch_message_history(
     message_id: Option<MessageId>,
 ) -> Result<(), Error> {
     let channel_id = channel.0.channel_id;
-    let bot_start_message = channel.0.inner.lock().await.bot_start_message;
+    let bot_start_message = channel.0.inner.lock().unwrap().bot_start_message;
     info!(
         "Fetching message history for channel {}. Requesting messages {} {}",
         channel_id,
@@ -566,7 +570,7 @@ async fn fetch_message_history(
         message_ids.reverse();
         // Convert to a VecDeque so we can use `append()` for speed
         let mut ids = VecDeque::from(message_ids);
-        let mut channel_guard = channel.0.inner.lock().await;
+        let mut channel_guard = channel.0.inner.lock().unwrap();
         // Combine with existing message ids, but remove duplicates that might
         // have been added by the message event handler while we were
         // retrieving history.
@@ -611,7 +615,7 @@ async fn fetch_message_history(
 /// Doesn't do anything since we're slash commands only now, and slash commands
 /// can't do toplevel if there's subs.
 ///
-// Commands must be async, but this is empty. 
+// Commands must be async, but this is empty.
 #[allow(clippy::unused_async)]
 async fn autodelete(_ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
@@ -705,16 +709,15 @@ async fn add_or_update_channel(
     debug!("Adding or updating channel {}", channel_id);
     let channel = data
         .channels
-        .get_or_default(http.clone(), channel_id, parent_id)
-        .await;
-    let mut channel_guard = channel.0.inner.lock().await;
-    let was_inactive = channel_guard.max_age.is_none() && channel_guard.max_messages.is_none();
-    channel_guard.max_age = max_age;
-    channel_guard.max_messages = max_messages;
-    channel_guard.bot_start_message = bot_start_message;
-    // Get for write to database
-    drop(channel_guard);
-
+        .get_or_default(http.clone(), channel_id, parent_id, &data.background_task_runtime);
+    let was_inactive = {
+        let mut channel_guard = channel.0.inner.lock().unwrap();
+        let was_inactive = channel_guard.max_age.is_none() && channel_guard.max_messages.is_none();
+        channel_guard.max_age = max_age;
+        channel_guard.max_messages = max_messages;
+        channel_guard.bot_start_message = bot_start_message;
+        was_inactive
+    };
     data.db_updater.send(channel_id).unwrap();
 
     if was_inactive {
@@ -755,7 +758,7 @@ async fn add_or_update_channel(
 ///
 /// Of course, this could be desirable, if the bot has lost track of things.
 async fn stop(ctx: Context<'_>) -> Result<(), Error> {
-    let message = if remove_channel(ctx.data(), ctx.channel_id()).await? {
+    let message = if remove_channel(ctx.data(), ctx.channel_id()) {
         "Autodelete stopped"
     } else {
         "Autodelete was not active"
@@ -764,14 +767,13 @@ async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-#[async_recursion]
-async fn remove_channel(data: &Data, channel_id: ChannelId) -> Result<bool, Error> {
+fn remove_channel(data: &Data, channel_id: ChannelId) -> bool {
     // Remove any threads we might have
     for thread_id in data
         .channels
         .0
-        .read()
-        .await
+        .lock()
+        .unwrap()
         .iter()
         .filter_map(|(id, channel)| {
             if channel.0.parent_id == Some(channel_id) {
@@ -781,22 +783,22 @@ async fn remove_channel(data: &Data, channel_id: ChannelId) -> Result<bool, Erro
             }
         })
     {
-        remove_channel(data, thread_id).await?;
+        remove_channel(data, thread_id);
     }
 
-    let return_value = data.channels.remove(channel_id).await.is_some();
+    let return_value = data.channels.remove(channel_id).is_some();
     // Remove from database
     data.db_updater.send(channel_id).unwrap();
-    Ok(return_value)
+    return_value
 }
 
 #[poise::command(slash_command, required_permissions = "MANAGE_MESSAGES")]
 /// Show autodelete settings for the current channel
 async fn status(ctx: Context<'_>) -> Result<(), Error> {
-    let channel = ctx.data().channels.get(ctx.channel_id()).await;
+    let channel = ctx.data().channels.get(ctx.channel_id());
     let message = match channel {
         Some(channel) => {
-            let channel_guard = channel.0.inner.lock().await;
+            let channel_guard = channel.0.inner.lock().unwrap();
             status_message(channel_guard.max_age, channel_guard.max_messages)
         }
         None => "Autodelete is not active".to_string(),
@@ -828,7 +830,13 @@ async fn delete_message_from_discord(
         Err(e) => {
             error!("Error deleting message: {:?}", e);
             debug!("Returning message to queue");
-            channel.0.inner.lock().await.delete_queue.push(message_id);
+            channel
+                .0
+                .inner
+                .lock()
+                .unwrap()
+                .delete_queue
+                .push(message_id);
             channel.0.delete_notify.notify_one();
         }
         Ok(()) => {}
@@ -842,14 +850,13 @@ async fn delete_message_from_discord(
 //
 // Also responsible for updating single channels when prompted through the
 // channel
-fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
+fn db_updater_thread(rx: DbUpdaterRx, channels: Channels) {
     thread::spawn(move || {
         // This is just to be able to use ? in the closure
         move || -> Result<(), Error> {
             // Use a separate connection for the save task
             debug!("Started save thread");
             let mut db_connection = Connection::open(DB_PATH)?;
-            let rx = rx.lock().unwrap();
             // Get sleep time from environment, defaults to 5 minutes
             let interval = std::env::var("SAVE_INTERVAL")
                 .map(|x| x.parse::<u64>().expect("SAVE_INTERVAL must be a number"))
@@ -863,7 +870,7 @@ fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
                     // on the channel.
                     match rx.recv_timeout(next_save - now) {
                         Ok(channel_id) => {
-                            let channel = channels.blocking_get(channel_id);
+                            let channel = channels.get(channel_id);
                             if let Some(channel) = channel {
                                 save_channel_to_db(&mut db_connection, &channel)?;
                             } else {
@@ -881,10 +888,7 @@ fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
                 now = Instant::now();
                 if now >= next_save {
                     next_save += interval;
-                    save_all_message_ids_to_db(
-                        &mut db_connection,
-                        &channels.blocking_to_cloned_vec(),
-                    )?;
+                    save_all_message_ids_to_db(&mut db_connection, &channels.to_cloned_vec())?;
                 }
             }
             Ok(())
@@ -898,7 +902,7 @@ fn db_updater_thread(rx: StdMutex<DbUpdaterRx>, channels: Channels) {
 fn save_channel_to_db(db_connection: &mut Connection, channel: &Channel) -> Result<(), Error> {
     let channel_id = channel.0.channel_id;
     debug!("Saving settings & message IDs for {}", channel_id);
-    let channel_guard = channel.0.inner.blocking_lock();
+    let channel_guard = channel.0.inner.lock().unwrap();
     let channel_id = channel_id.get() as i64;
     let parent_id = channel.0.parent_id.map(|x| x.get() as i64);
     let max_age = channel_guard
@@ -975,7 +979,7 @@ fn save_all_message_ids_to_db(
     let mut all_last_seens = Vec::new();
     // Using for loop because async closures aren't stable yet
     for (channel_id, channel) in channels_local {
-        let channel_guard = channel.0.inner.blocking_lock();
+        let channel_guard = channel.0.inner.lock().unwrap();
         for message_id in &channel_guard.message_ids {
             all_ids.push((*channel_id, *message_id));
         }
@@ -1005,15 +1009,13 @@ fn save_all_message_ids_to_db(
     Ok(())
 }
 
-async fn ready_handler(http: Arc<Http>, data: &Data, data_about_bot: &Ready) {
+fn ready_handler(http: &Arc<Http>, data: &Data, data_about_bot: &Ready) {
     info!("{} is connected!", data_about_bot.user.name);
 
     // Catch up on messages that have happened since the bot was last online
-    let channels = data.channels.to_cloned_vec().await;
+    let channels = data.channels.to_cloned_vec();
     for (_, channel) in channels {
-        let channel_guard = channel.0.inner.lock().await;
-        let last_seen = channel_guard.last_seen_message;
-        drop(channel_guard);
+        let last_seen = channel.0.inner.lock().unwrap().last_seen_message;
         let http = http.clone();
         let db_updater = data.db_updater.clone();
         tokio::spawn(async move {
@@ -1024,25 +1026,25 @@ async fn ready_handler(http: Arc<Http>, data: &Data, data_about_bot: &Ready) {
     }
 }
 
-async fn message_handler(data: &Data, new_message: &Message) -> Result<(), Error> {
+fn message_handler(data: &Data, new_message: &Message) {
     debug!(
         "Received message {} on channel {}",
         new_message.id, new_message.channel_id
     );
-    let channel = data.channels.get(new_message.channel_id).await;
+    let channel = data.channels.get(new_message.channel_id);
     let Some(channel) = channel else {
         debug!("Ignoring message in channel without settings");
-        return Ok(());
+        return;
     };
-    let mut channel_guard = channel.0.inner.lock().await;
+    let mut channel_guard = channel.0.inner.lock().unwrap();
     if channel_guard.max_age.is_none() && channel_guard.max_messages.is_none() {
         error!("Ignoring message in channel without both maxes (shouldn't happen?)");
-        return Ok(());
+        return;
     }
     if let Some(bot_start_message) = channel_guard.bot_start_message {
         if bot_start_message == new_message.id {
             debug!("Ignoring bot start message");
-            return Ok(());
+            return;
         }
     }
     channel_guard.last_seen_message = Some(new_message.id);
@@ -1058,8 +1060,6 @@ async fn message_handler(data: &Data, new_message: &Message) -> Result<(), Error
         // MAX duration, so notify the task to wake up.
         channel.0.expire_notify.notify_one();
     }
-
-    Ok(())
 }
 
 async fn thread_create_handler(
@@ -1074,15 +1074,15 @@ async fn thread_create_handler(
         "Received thread create {} on channel {}",
         thread.id, parent_id
     );
-    let channel = data.channels.get(parent_id).await;
+    let channel = data.channels.get(parent_id);
     let Some(channel) = channel else {
         debug!("Ignoring thread create in channel without settings");
         return Ok(());
     };
-    let channel_guard = channel.0.inner.lock().await;
-    let max_age = channel_guard.max_age;
-    let max_messages = channel_guard.max_messages;
-    drop(channel_guard);
+    let (max_age, max_messages) = {
+        let channel_guard = channel.0.inner.lock().unwrap();
+        (channel_guard.max_age, channel_guard.max_messages)
+    };
     add_or_update_channel(
         http,
         data,
@@ -1095,10 +1095,9 @@ async fn thread_create_handler(
     .await
 }
 
-async fn thread_delete_handler(data: &Data, thread: &PartialGuildChannel) -> Result<(), Error> {
+fn thread_delete_handler(data: &Data, thread: &PartialGuildChannel) {
     debug!("Received thread delete {}", thread.id);
-    remove_channel(data, thread.id).await?;
-    Ok(())
+    remove_channel(data, thread.id);
 }
 
 async fn event_event_handler(
@@ -1111,10 +1110,10 @@ async fn event_event_handler(
     trace!("Event: {:#?}", event);
     match event {
         FullEvent::Ready { data_about_bot } => {
-            ready_handler(ctx.http.clone(), data, data_about_bot).await;
+            ready_handler(&ctx.http, data, data_about_bot);
         }
         FullEvent::Message { new_message } => {
-            message_handler(data, new_message).await?;
+            message_handler(data, new_message);
         }
         FullEvent::ThreadCreate { thread } => {
             thread_create_handler(ctx.http.clone(), data, thread).await?;
@@ -1123,7 +1122,7 @@ async fn event_event_handler(
             thread,
             full_thread_data: _,
         } => {
-            thread_delete_handler(data, thread).await?;
+            thread_delete_handler(data, thread);
         }
         _ => (),
     }
@@ -1171,17 +1170,41 @@ async fn wait_for_termination() {
 }
 
 fn exit_handler(all_channels: Channels) {
+    // Because the things we want to do on exit are not async, we spawn a thread
+    // to do them, since they have to wait for async tasks to finish while
+    // holding the lock on the channels map, and we don't want to block the
+    // async runtime.
+    //
+    // So make a oneshot and make the thread the receiver. This allows the
+    // runtime to run the expire/deletion tasks that we're waiting on to finish.
+    // And those tasks can run because we're only holding the lock on the map,
+    // not on the inner channel data.
+    //
+    // However... incoming events can still try to access the channels map, so
+    // that can block the runtime. Which in turn can cause the background tasks
+    // to never finish. So we need to either:
+    // - Make the event handler aware that we're shutting down before we lock
+    //   the map. For instance using an AtomicBool.
+    // - Put the background tasks on a separate tokio runtime, so they can
+    //   always finish up.
+    //
+    // I _think_ the separate runtime is faster, because there's less atomic
+    // operations that way.
+    let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        // This is not async, but we're at startup, so a hiccup is acceptable
-        let mut db_connection = Connection::open(DB_PATH).unwrap();
         wait_for_termination().await;
         info!("Signal received, shutting down.");
-        // We hang on to the write lock until the end of the function, so that
-        // nothing can be added, nor that the periodic save task can run before
-        // we exit.
-        // Also, we keep doing everything async until it's time to write to the
-        // database, so that we avoid deadlocks.
-        let all_channels_guard = all_channels.0.write().await;
+        // Send the signal to the thread
+        tx.send(()).unwrap();
+    });
+
+    thread::spawn(move || {
+        let mut db_connection = Connection::open(DB_PATH).unwrap();
+        // Wait for the signal to exit
+        rx.recv().unwrap();
+        // We hang on to the lock until the end of the function, so that nothing
+        // can be added, nor that the periodic save task can run before we exit.
+        let all_channels_guard = all_channels.0.lock().unwrap();
         let all_channels_local = all_channels_guard
             .iter()
             .map(|(id, channel)| (*id, channel.clone()))
@@ -1189,24 +1212,24 @@ fn exit_handler(all_channels: Channels) {
         // Stop the tasks on the channels
         debug!("Stopping tasks");
         for (_, channel) in &all_channels_local {
-            channel.stop_tasks().await;
+            channel.stop_tasks();
         }
         // Wait for all the channels' tasks to finish
         debug!("Waiting for tasks to finish...");
         for (_, channel) in &all_channels_local {
             loop {
-                if channel.tasks_stopped().await {
+                if channel.tasks_stopped() {
                     break;
                 }
                 debug!("Waiting for tasks to finish (100ms sleep)");
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                thread::sleep(Duration::from_millis(100));
             }
         }
         debug!("Tasks finished");
         // Return messages from delete queues to message IDs
         debug!("Returning messages from delete queues");
         for (channel_id, channel) in &all_channels_local {
-            let mut channel_guard = channel.0.inner.lock().await;
+            let mut channel_guard = channel.0.inner.lock().unwrap();
             debug!(
                 "Channel {} has {} messages in delete queue",
                 channel_id,
@@ -1216,11 +1239,7 @@ fn exit_handler(all_channels: Channels) {
                 channel_guard.message_ids.push_back(message_id);
             }
         }
-        spawn_blocking(move || {
-            save_all_message_ids_to_db(&mut db_connection, &all_channels_local).unwrap();
-        })
-        .await
-        .unwrap();
+        save_all_message_ids_to_db(&mut db_connection, &all_channels_local).unwrap();
         warn!("Saved message IDs, exiting due to signal.");
         std::process::exit(0);
     });
@@ -1307,8 +1326,9 @@ async fn main() -> Result<(), Error> {
     drop(conn);
 
     let (db_updater_tx, db_updater_rx) = mpsc::channel();
-    // Just so we can send them to the threads that needs to receive stuff
-    let db_updater_rx = StdMutex::new(db_updater_rx);
+    // Setup's closure requires things to be Sync, so wrap a mutex around the
+    // receiver. Just to `into_inner()` it inside the closure.
+    let db_updater_rx = Mutex::new(db_updater_rx);
 
     let token = env::var("DISCORD_TOKEN").expect("missing DISCORD_TOKEN");
     let intents = GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILDS;
@@ -1322,6 +1342,7 @@ async fn main() -> Result<(), Error> {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
 
+                let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
                 // Converting from ChannelInner to Channel requires the Http client, so we do it here
                 let channels = channels
                     .into_iter()
@@ -1330,16 +1351,20 @@ async fn main() -> Result<(), Error> {
                         inner.message_ids = message_ids.remove(&channel_id).unwrap_or_default();
                         (
                             channel_id,
-                            Channel::new(ctx.http.clone(), channel_id, parent_id, inner),
+                            Channel::new(ctx.http.clone(), channel_id, parent_id, inner, &runtime),
                         )
                     })
                     .collect::<HashMap<ChannelId, Channel>>();
-                let channels = Channels(Arc::new(RwLock::new(channels)));
+                let channels = Channels(Arc::new(Mutex::new(channels)));
+                // Now that we're inside the closure, we can into_inner this to
+                // get rid of the Mutex
+                let db_updater_rx = db_updater_rx.into_inner().unwrap();
                 // background thread for writing to database
                 db_updater_thread(db_updater_rx, channels.clone());
                 // background task to handle exiting
                 exit_handler(channels.clone());
                 let data = Data {
+                    background_task_runtime: runtime,
                     channels,
                     db_updater: db_updater_tx,
                 };
