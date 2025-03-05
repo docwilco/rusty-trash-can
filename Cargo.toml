@@ -6,19 +6,19 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.95"
+anyhow = "1.0.97"
 async-recursion = "1.1.1"
-chrono = "0.4.39"
+chrono = "0.4.40"
 dotenvy = "0.15.7"
-duration-str = { version = "0.12.0", default-features = false, features = [
+duration-str = { version = "0.13.0", default-features = false, features = [
     "serde",
     "chrono",
 ] }
 env_logger = "0.11.6"
 futures = "0.3.31"
 itertools = "0.14.0"
-log = "0.4.22"
-oneshot = "0.1.8"
+log = "0.4.26"
+oneshot = "0.1.11"
 poise = { git = "https://github.com/serenity-rs/poise.git", branch = "next", default-features = false, features = [
     "chrono",
     "cache",
@@ -34,7 +34,7 @@ serenity = { version = "0.12.4", default-features = false, features = [
     "model",
     "chrono",
 ] }
-tokio = { version = "1.42.0", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-rusqlite = "0.6.0"
 
 [profile.release]
